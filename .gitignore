@@ -1,0 +1,6 @@
+node_modules/
+.smoke/
+*.log
+
+.DS_Store
+compact-prompt.before-clarity.md
