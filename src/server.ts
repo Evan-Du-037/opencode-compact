@@ -4,11 +4,36 @@ import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 import { compactionInstructions, fingerprint, previousHandoff, PLUGIN_ID, type Message, type Request } from "./core.ts"
 import { read, save, remove, pathFor, storeRoot, canonical } from "./store.ts"
 
+type SharedState = {
+  backend: string
+  owners: number
+  ready: Promise<void>
+  active: Map<string, { request: Request; parentID: string; received: boolean }>
+}
+// Native TUI startup can load the server plugin through multiple Effect runtimes
+// in the same worker. Each registration must use the same identity and receipts.
+const registryKey = Symbol.for("evan.compact-form.server-state.v2")
+const globals = globalThis as typeof globalThis & { [registryKey]?: Map<string, SharedState> }
+const states = globals[registryKey] ??= new Map<string, SharedState>()
+
 export const server: Plugin = async ({ client, directory }, options) => {
-  const root = storeRoot(options), backend = randomUUID()
+  const root = storeRoot(options)
   const ready = pathFor(root, directory, "backend", "ready")
-  const active = new Map<string, { request: Request; parentID: string; received: boolean }>()
-  await save(ready, { backend, pid: process.pid, directory: resolve(directory), version: 2 })
+  const key = JSON.stringify([canonical(root), canonical(directory)])
+  let state = states.get(key)
+  if (!state) {
+    const backend = randomUUID()
+    state = { backend, owners: 0, active: new Map(), ready: save(ready, { backend, pid: process.pid, directory: resolve(directory), version: 2 }) }
+    states.set(key, state)
+  }
+  const shared = state
+  shared.owners++
+  try { await shared.ready } catch (error) {
+    if (--shared.owners === 0 && states.get(key) === shared) states.delete(key)
+    throw error
+  }
+  const { backend, active } = shared
+  let disposed = false
   async function receipt(request: Request, status: string, error?: string) {
     await save(pathFor(root, directory, request.sessionID, "receipt"), { id: request.id, status, error, time: Date.now() })
   }
@@ -24,7 +49,12 @@ export const server: Plugin = async ({ client, directory }, options) => {
       // Automatic compaction must not consume a request awaiting explicit confirmation.
       if (marker?.auto) return
       try {
-        if (!marker || !parent || request.version !== 2 || request.backend !== backend || request.sessionID !== sessionID || canonical(request.directory) !== canonical(directory) || Date.now() - request.created > 10 * 60_000) throw new Error("压缩请求过期或服务端已重启，请重新填写。")
+        if (!marker || !parent) throw new Error("未找到本次压缩标记，会话可能在提交期间发生变化。请重新打开 /compact。")
+        if (request.version !== 2) throw new Error("压缩表单与服务端插件版本不一致，请完全退出并重启 OpenCode。")
+        if (request.backend !== backend) throw new Error("压缩请求连接到了不同的服务端实例。请检查是否同时打开了同一项目的多个 OpenCode，再重启当前实例。")
+        if (request.sessionID !== sessionID) throw new Error("压缩请求的会话不匹配，请在目标会话重新打开 /compact。")
+        if (canonical(request.directory) !== canonical(directory)) throw new Error("压缩请求的项目目录不匹配，请在目标项目重新打开 /compact。")
+        if (!Number.isFinite(request.created) || Date.now() - request.created > 10 * 60_000) throw new Error("压缩请求已超过 10 分钟，请重新打开 /compact 后提交。")
         if (fingerprint(messages.slice(0, -1)) !== request.base) throw new Error("填写期间会话已变化，请重新打开 /compact。")
         const instructions = await compactionInstructions(request.fields, typeof options?.templatePath === "string" ? options.templatePath : undefined)
         if (instructions) {
@@ -63,6 +93,10 @@ export const server: Plugin = async ({ client, directory }, options) => {
       }
     },
     dispose: async () => {
+      if (disposed) return
+      disposed = true
+      if (--shared.owners > 0) return
+      if (states.get(key) === shared) states.delete(key)
       if ((await read<{ backend: string }>(ready))?.backend === backend) await remove(ready)
       for (const { request } of active.values()) await receipt(request, "error", "OpenCode 已关闭，压缩未确认完成。")
       active.clear()

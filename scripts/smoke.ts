@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { compactionInstructions, fingerprint, type Message, type Request } from "../src/core.ts"
 import { pathFor, publish, read } from "../src/store.ts"
+import { compactSession } from "../src/compact.ts"
 
 const hold = process.argv.includes("--hold")
 const root = await mkdtemp(join(tmpdir(), "opencode-compact-smoke-"))
@@ -108,6 +109,12 @@ try {
     assert(second.includes("已有交接摘要（历史资料）"), "previous summary missing from repeated compaction")
     assert(second.includes(mockSummary), "previous model summary missing")
     assert(!second.includes(request.fields.preserve), "previous preserve requirement leaked into next compaction")
+    const fork = (await client.session.fork({ sessionID, directory })).data!
+    await compactSession({ api: { client, state: { config: {} } } as any, root: stateDir, directory,
+      sessionID: fork.id, fields: { focus: "", preserve: "", discard: "", extra: "" }, signal: new AbortController().signal })
+    const blank = JSON.stringify(requests.at(-1).messages)
+    assert(blank.includes("压缩后的内容必须自成一体"), "blank fork compaction lost general template requirements")
+    console.log("PASS: fork session with blank form completed through the TUI submission function")
     console.log("PASS: no picker agent, one model call, replacement prompt with history, unmodified model summary, continuation and repeated compaction")
     console.log(`Isolated test files: ${root}`)
   }

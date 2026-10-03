@@ -39,8 +39,26 @@ test("template changes are loaded on the next call without module or plugin relo
     const changed = await compactionInstructions({ ...empty, focus: "要求" }, file)
     expect(changed).toContain("新措辞已生效")
     expect(changed).not.toContain("通用指令")
+    expect(await compactionInstructions(empty, file)).toBe("新措辞已生效")
     await rm(file)
     await expect(compactionInstructions({ ...empty, focus: "要求" }, file)).rejects.toThrow("无法读取压缩模板")
-    expect(await compactionInstructions(empty, file)).toBe("")
+    await expect(compactionInstructions(empty, file)).rejects.toThrow("无法读取压缩模板")
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+
+test("all 16 combinations retain general requirements and only populated sections", () => {
+  const keys = Object.keys(empty) as Array<keyof typeof empty>
+  for (let mask = 0; mask < 16; mask++) {
+    const fields = { ...empty }
+    keys.forEach((key, i) => { fields[key] = mask & (1 << i) ? `内容-${key}` : " \t\n　" })
+    const prompt = renderCompactionTemplate(template, fields)
+    expect(prompt).toContain("通用指令")
+    keys.forEach((key, i) => {
+      for (const prefix of ["标题", "说明", "内容"]) {
+        expect(prompt.includes(`${prefix}-${key}`)).toBe(Boolean(mask & (1 << i)))
+      }
+    })
+    expect(prompt).not.toContain("{{")
+  }
 })

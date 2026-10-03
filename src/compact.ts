@@ -39,7 +39,17 @@ export async function compactSession({ api, root, directory, sessionID, fields, 
     signal.throwIfAborted()
     await publish(root, request)
     signal.throwIfAborted()
-    await api.client.session.summarize({ sessionID, directory, ...model, auto: false }, { throwOnError: true, signal })
+    try {
+      await api.client.session.summarize({ sessionID, directory, ...model, auto: false }, { throwOnError: true, signal })
+    } catch (error) {
+      // OpenCode masks thrown hook errors as "unexpected server error" over HTTP.
+      // The hook persists the original error before rejecting; only trust this request's receipt.
+      const receipt = await read<{ id: string; status: string; error?: string }>(pathFor(root, directory, sessionID, "receipt")).catch(() => undefined)
+      if (receipt?.id === request.id && receipt.status === "error" && receipt.error) {
+        throw new Error(receipt.error.replace(/^Error: /, ""), { cause: error })
+      }
+      throw error
+    }
     // Event hooks are asynchronous; allow the persisted completion receipt to catch up.
     let receipt: { id: string; status: string; error?: string } | undefined
     for (let i = 0; i < 20; i++) {

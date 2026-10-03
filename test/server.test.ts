@@ -41,14 +41,18 @@ test("single request replaces prompt, leaves model output untouched and does not
   } finally { await f.cleanup() }
 })
 
-test("blank form leaves default and custom compaction prompts untouched", async () => {
+test("blank form replaces prompt and carries previous summary and plugin context", async () => {
   const f = await fixture()
   try {
     f.request.fields = { focus: " ", preserve: "\n", discard: "", extra: "\t" }
+    f.messages.unshift({ info: { id: "old", role: "assistant", summary: true, finish: "stop" }, parts: [{ id: "old-text", type: "text", text: "之前已完成的工作" }] })
+    f.request.base = fingerprint(f.messages.slice(0, -1))
     await publish(f.root, f.request)
     const output = { context: ["已有上下文"], prompt: "已有模板" }
     await f.hooks["experimental.session.compacting"]!({ sessionID: f.sessionID }, output)
-    expect(output).toEqual({ context: ["已有上下文"], prompt: "已有模板" })
+    expect(output.prompt).toBe([await compactionInstructions(f.request.fields), "已有交接摘要（历史资料）：\n之前已完成的工作", "已有上下文"].join("\n\n"))
+    expect(output.prompt).not.toContain("已有模板")
+    expect(output.context).toEqual([])
     const text = { text: "原始摘要" }
     await f.hooks["experimental.text.complete"]!({ sessionID: f.sessionID, messageID: "summary1", partID: "text1" }, text)
     expect(text.text).toBe("原始摘要")
@@ -102,4 +106,49 @@ test("replacement includes previous handoff and other plugin context, but not ol
     expect(output.prompt).not.toContain("旧模板")
     expect(output.context).toEqual([])
   } finally { await f.cleanup() }
+})
+
+for (const scenario of ["marker", "backend", "expired", "version"] as const) {
+  test(`request validation reports a specific failure: ${scenario}`, async () => {
+    const f = await fixture()
+    try {
+      const expected = { marker: "未找到本次压缩标记", backend: "不同的服务端实例", expired: "超过 10 分钟", version: "版本不一致" }[scenario]
+      if (scenario === "marker") f.messages.at(-1)!.parts = []
+      if (scenario === "backend") f.request.backend = "different-instance"
+      if (scenario === "expired") f.request.created = Date.now() - 11 * 60_000
+      if (scenario === "version") (f.request as any).version = 1
+      await publish(f.root, f.request)
+      await expect(f.hooks["experimental.session.compacting"]!({ sessionID: f.sessionID }, { context: [] })).rejects.toThrow(expected)
+      const receipt = await read<any>(pathFor(f.root, f.directory, f.sessionID, "receipt"))
+      expect(receipt.id).toBe(f.request.id)
+      expect(receipt.error).toContain(expected)
+    } finally { await f.cleanup() }
+  })
+}
+
+test("duplicate native runtime registrations share identity, active request and lifetime", async () => {
+  const f = await fixture()
+  let second: Awaited<ReturnType<typeof server>> | undefined
+  try {
+    second = await server({ directory: f.directory, client: { session: {
+      messages: async () => ({ data: f.messages }),
+      message: async () => ({ data: { info: { id: "summary1", role: "assistant", summary: true, parentID: "compact1" }, parts: [] } }),
+    } } } as any, { stateDir: f.root })
+    const ready = await read<{ backend: string }>(pathFor(f.root, f.directory, "backend", "ready"))
+    expect(ready!.backend).toBe(f.request.backend)
+    // The TUI reads the last registration's readiness, but the first runtime executes compaction.
+    await publish(f.root, { ...f.request, backend: ready!.backend })
+    const output = { context: [] as string[], prompt: "native" }
+    await f.hooks["experimental.session.compacting"]!({ sessionID: f.sessionID }, output)
+    expect(output.prompt).toBe(await compactionInstructions(f.request.fields))
+    await f.hooks.dispose?.()
+    await f.hooks.dispose?.() // lifecycle disposal is idempotent
+    expect(await read(pathFor(f.root, f.directory, "backend", "ready"))).toBeDefined()
+    expect((await read<any>(pathFor(f.root, f.directory, f.sessionID, "receipt"))).status).toBe("started")
+    await second["experimental.text.complete"]!({ sessionID: f.sessionID, messageID: "summary1", partID: "text1" }, { text: "summary" })
+    await second.event!({ event: { type: "session.compacted", properties: { sessionID: f.sessionID } } as any })
+    expect((await read<any>(pathFor(f.root, f.directory, f.sessionID, "receipt"))).status).toBe("done")
+    await second.dispose?.()
+    expect(await read(pathFor(f.root, f.directory, "backend", "ready"))).toBeUndefined()
+  } finally { await second?.dispose?.(); await f.cleanup() }
 })

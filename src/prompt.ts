@@ -41,7 +41,6 @@ export function renderCompactionTemplate(template: string, fields: Fields): stri
 
 /** Read on every manual compaction so wording changes do not require an OpenCode restart. */
 export async function compactionInstructions(fields: Fields, templatePath: string | URL = defaultTemplate): Promise<string> {
-  if (keys.every(key => !fields[key]?.trim())) return ""
   let template: string
   try { template = await readFile(templatePath, "utf8") }
   catch (error) { throw new Error(`无法读取压缩模板 ${templatePath}：${error instanceof Error ? error.message : String(error)}`) }

@@ -3,8 +3,11 @@ import { readFile } from "node:fs/promises"
 import { compactionInstructions, fingerprint, previousHandoff, visibleHistory, type Message } from "../src/core.ts"
 
 const empty = { focus: "", preserve: "", discard: "", extra: "" }
-test("empty and whitespace-only fields add no instructions", async () => {
-  for (const blank of ["", " \t\r\n　"]) expect(await compactionInstructions({ focus: blank, preserve: blank, discard: blank, extra: blank })).toBe("")
+test("empty and whitespace-only forms use the general template requirements", async () => {
+  const template = await readFile(new URL("../compact-prompt.md", import.meta.url), "utf8")
+  const general = template.replace(/{{#(focus|preserve|discard|extra)}}[\s\S]*?{{\/\1}}/g, "").trim()
+  expect(general).not.toBe("")
+  for (const blank of ["", " \t\r\n　"]) expect(await compactionInstructions({ focus: blank, preserve: blank, discard: blank, extra: blank })).toBe(general)
 })
 test("editable template inserts all four fields without leaving template syntax", async () => {
   const fields = { focus: "重点测试内容", preserve: "原文定位测试内容", discard: "省略测试内容", extra: "额外信息测试内容" }
