@@ -2,31 +2,21 @@ import { test, expect } from "bun:test"
 import { readFile } from "node:fs/promises"
 import { compactionInstructions, fingerprint, previousHandoff, visibleHistory, type Message } from "../src/core.ts"
 
-const empty = { focus: "", preserve: "", discard: "", extra: "" }
-test("empty and whitespace-only forms use the general template requirements", async () => {
+test("empty and whitespace-only forms retain general requirements and omit the user block", async () => {
   const template = await readFile(new URL("../compact-prompt.md", import.meta.url), "utf8")
-  const general = template.replace(/{{#(focus|preserve|discard|extra)}}[\s\S]*?{{\/\1}}/g, "").trim()
+  const general = template.replace(/{{#instructions}}[\s\S]*?{{\/instructions}}/g, "").trim()
   expect(general).not.toBe("")
-  for (const blank of ["", " \t\r\n　"]) expect(await compactionInstructions({ focus: blank, preserve: blank, discard: blank, extra: blank })).toBe(general)
+  expect(general).not.toContain("用户提示")
+  expect(general).not.toContain("未提供")
+  expect(general).not.toContain("未填写")
+  for (const blank of ["", " \t\r\n　"]) expect(await compactionInstructions({ instructions: blank })).toBe(general)
 })
-test("editable template inserts all four fields without leaving template syntax", async () => {
-  const fields = { focus: "重点测试内容", preserve: "原文定位测试内容", discard: "省略测试内容", extra: "额外信息测试内容" }
-  const prompt = await compactionInstructions(fields)
-  for (const value of Object.values(fields)) expect(prompt).toContain(value)
-  expect(prompt).not.toMatch(/{{[#/]?(focus|preserve|discard|extra)}}/)
-})
-test("editable template drops the entire unfilled sections regardless of their wording", async () => {
-  const template = await readFile(new URL("../compact-prompt.md", import.meta.url), "utf8")
-  const locator = "刚刚讨论的接口定义"
-  const prompt = await compactionInstructions({ ...empty, preserve: locator })
-  expect(prompt).toContain(locator)
-  for (const key of ["focus", "discard", "extra"]) {
-    const start = template.indexOf(`{{#${key}}}`), end = template.indexOf(`{{/${key}}}`)
-    const body = template.slice(start + `{{#${key}}}`.length, end)
-    const heading = body.split("\n").find(line => line.trim().startsWith("#"))
-    if (heading) expect(prompt).not.toContain(heading)
-  }
-  expect(prompt).not.toMatch(/{{[#/]?(focus|preserve|discard|extra)}}/)
+test("editable template inserts a free-form prompt literally", async () => {
+  const instructions = "下一步只检查 GC。\n刚刚那段接口定义保留原文；不需要 UI。\n## 自己的标题\n{{focus}} {{instructions}}"
+  const prompt = await compactionInstructions({ instructions })
+  expect(prompt).toContain(instructions)
+  expect(prompt).not.toContain("{{#instructions}}")
+  expect(prompt).not.toContain("{{/instructions}}")
 })
 test("history snapshot detects edits and excludes reverted messages", () => {
   const messages: Message[] = [{ info: { id: "m1", role: "user" }, parts: [{ id: "p1", type: "text", text: "old" }] }]

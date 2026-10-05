@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { createSignal, For, Show, onMount, onCleanup } from "solid-js"
+import { createSignal, Show, onMount, onCleanup } from "solid-js"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
@@ -12,28 +12,13 @@ import { storeRoot } from "./store.ts"
 import { compactSession } from "./compact.ts"
 import { clearField, moveBetweenFields } from "./form-editing.ts"
 
-const labels = ["接下来的重点", "哪些历史内容需要原文保留", "不再需要", "额外信息"] as const
-const keys = ["focus", "preserve", "discard", "extra"] as const
-const empty: Fields = { focus: "", preserve: "", discard: "", extra: "" }
-
-function template(fields: Fields) { return labels.map((label, i) => `## ${label}\n${fields[keys[i]!]}\n`).join("\n") }
-export function parseTemplate(text: string): Fields {
-  const fields = { ...empty }
-  for (let i = 0; i < labels.length; i++) {
-    const header = `## ${labels[i]}`
-    const start = text.indexOf(header)
-    if (start < 0) throw new Error(`请保留模板标题：${header}`)
-    const next = text.indexOf("\n## ", start + header.length)
-    fields[keys[i]!] = text.slice(start + header.length, next < 0 ? undefined : next).trim()
-  }
-  return fields
-}
+const empty: Fields = { instructions: "" }
 
 async function edit(api: TuiPluginApi, fields: Fields) {
   const command = process.env.VISUAL || process.env.EDITOR
   if (!command) throw new Error("未设置 VISUAL 或 EDITOR。可直接在表单填写，或设置 EDITOR='code --wait' 后重新启动。")
   const dir = await mkdtemp(join(tmpdir(), "opencode-compact-editor-")), file = join(dir, "交接要求.md")
-  await writeFile(file, template(fields), { mode: 0o600 })
+  await writeFile(file, fields.instructions, { mode: 0o600 })
   api.renderer.suspend()
   try {
     // The editor command is the user's trusted environment setting. The file is passed as a positional argument.
@@ -42,7 +27,7 @@ async function edit(api: TuiPluginApi, fields: Fields) {
       child.on("error", reject)
       child.on("exit", code => code === 0 ? resolvePromise() : reject(new Error("编辑器已取消或异常退出，尚未开始压缩。")))
     })
-    return parseTemplate(await readFile(file, "utf8"))
+    return { instructions: await readFile(file, "utf8") }
   } finally {
     await rm(dir, { force: true, recursive: true })
     api.renderer.resume(); api.renderer.requestRender()
@@ -99,11 +84,11 @@ function Form(props: { api: TuiPluginApi; controller: AbortController; initial: 
   const [buttonFocused, setButtonFocused] = createSignal(false)
   let inputs: TextareaRenderable[] = [], focusIndex = 0
   const capture = () => {
-    if (step() === "form") setFields(Object.fromEntries(keys.map((key, i) => [key, inputs[i]?.plainText ?? fields()[key]])) as Fields)
+    if (step() === "form") setFields({ instructions: inputs[0]?.plainText ?? fields().instructions })
   }
   const focus = (index = focusIndex) => {
-    focusIndex = (index + keys.length + 1) % (keys.length + 1)
-    setButtonFocused(focusIndex === keys.length)
+    focusIndex = (index + 2) % 2
+    setButtonFocused(focusIndex === 1)
     if (buttonFocused()) inputs.forEach(input => input.blur())
     else inputs[focusIndex]?.focus()
   }
@@ -111,7 +96,7 @@ function Form(props: { api: TuiPluginApi; controller: AbortController; initial: 
   const move = (direction: -1 | 1) => {
     if (step() === "form") {
       focusIndex = moveBetweenFields(inputs, focusIndex, direction, true)
-      setButtonFocused(focusIndex === keys.length)
+      setButtonFocused(focusIndex === 1)
     }
   }
 
@@ -154,18 +139,18 @@ function Form(props: { api: TuiPluginApi; controller: AbortController; initial: 
     <text fg={theme.primary}><b>Compact · 本次交接要求</b></text>
     <Show when={error()}><text fg={theme.error} wrapMode="word">{error()}</text></Show>
     <Show when={step() === "form"}>
-      <For each={keys}>{(key, i) => <box gap={0}>
-        <text fg={theme.text}>{labels[i()]}</text>
+      <box gap={0}>
+        <text fg={theme.text}>本次压缩提示（可留空）</text>
         <box backgroundColor={theme.backgroundElement}>
-          <textarea ref={(ref: TextareaRenderable) => { inputs[i()] = ref }} initialValue={fields()[key]}
-            height={Math.max(1, Math.min(4, Math.floor((dimensions().height * 0.72 - 15) / keys.length)))}
-            placeholder={key === "focus" ? "下一阶段主要做什么；空白则按原目标继续" : key === "preserve" ? "例如：刚刚关于 GC 触发条件的完整讨论，包括最后的纠正" : key === "discard" ? "哪些支线、过时方案不再需要详细总结" : "补充背景、新信息或其他交接要求；可留空"}
+          <textarea ref={(ref: TextareaRenderable) => { inputs[0] = ref }} initialValue={fields().instructions}
+            height={Math.max(2, Math.min(16, Math.floor(dimensions().height * 0.72 - 9)))}
+            placeholder="直接写下本次压缩的要求；留空则使用通用压缩要求。"
             textColor={theme.text} focusedTextColor={theme.text} placeholderColor={theme.textMuted} cursorColor={theme.primary}
-            onContentChange={() => { const input = inputs[i()]; if (input) setFields(previous => ({ ...previous, [key]: input.plainText })) }}
-            onMouseDown={() => { focusIndex = i(); setButtonFocused(false) }} />
+            onContentChange={() => { const input = inputs[0]; if (input) setFields({ instructions: input.plainText }) }}
+            onMouseDown={() => { focusIndex = 0; setButtonFocused(false) }} />
         </box>
-      </box>}</For>
-      <text fg={theme.textMuted}>↑↓ 边界切换 · Tab 切换 · Ctrl+C 清空 · Ctrl+Z 撤销</text>
+      </box>
+      <text fg={theme.textMuted}>末行 ↓ 到按钮 · Tab 切换 · Ctrl+C 清空 · Ctrl+Z 撤销</text>
       <text fg={theme.textMuted}>Enter 换行/提交 · Ctrl+E 编辑器 · Ctrl+S 确认 · Esc 保存草稿并关闭</text>
       <box flexDirection="row" gap={3}>
         <text fg={theme.primary} onMouseUp={confirm}>{buttonFocused() ? "▶ [ 开始压缩 ]" : "[ 开始压缩 ]"}</text>

@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "./core.ts"
 import { randomUUID } from "node:crypto"
 import { resolve } from "node:path"
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
@@ -12,7 +13,7 @@ type SharedState = {
 }
 // Native TUI startup can load the server plugin through multiple Effect runtimes
 // in the same worker. Each registration must use the same identity and receipts.
-const registryKey = Symbol.for("evan.compact-form.server-state.v2")
+const registryKey = Symbol.for("evan.compact-form.server-state.v3")
 const globals = globalThis as typeof globalThis & { [registryKey]?: Map<string, SharedState> }
 const states = globals[registryKey] ??= new Map<string, SharedState>()
 
@@ -23,7 +24,7 @@ export const server: Plugin = async ({ client, directory }, options) => {
   let state = states.get(key)
   if (!state) {
     const backend = randomUUID()
-    state = { backend, owners: 0, active: new Map(), ready: save(ready, { backend, pid: process.pid, directory: resolve(directory), version: 2 }) }
+    state = { backend, owners: 0, active: new Map(), ready: save(ready, { backend, pid: process.pid, directory: resolve(directory), version: PROTOCOL_VERSION }) }
     states.set(key, state)
   }
   const shared = state
@@ -50,7 +51,7 @@ export const server: Plugin = async ({ client, directory }, options) => {
       if (marker?.auto) return
       try {
         if (!marker || !parent) throw new Error("未找到本次压缩标记，会话可能在提交期间发生变化。请重新打开 /compact。")
-        if (request.version !== 2) throw new Error("压缩表单与服务端插件版本不一致，请完全退出并重启 OpenCode。")
+        if (request.version !== PROTOCOL_VERSION) throw new Error("压缩表单与服务端插件版本不一致，请完全退出并重启 OpenCode。")
         if (request.backend !== backend) throw new Error("压缩请求连接到了不同的服务端实例。请检查是否同时打开了同一项目的多个 OpenCode，再重启当前实例。")
         if (request.sessionID !== sessionID) throw new Error("压缩请求的会话不匹配，请在目标会话重新打开 /compact。")
         if (canonical(request.directory) !== canonical(directory)) throw new Error("压缩请求的项目目录不匹配，请在目标项目重新打开 /compact。")

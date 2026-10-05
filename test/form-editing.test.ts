@@ -3,41 +3,32 @@ import { TextareaRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { clearField, moveBetweenFields } from "../src/form-editing.ts"
 
-test("arrows traverse text before fields, including wrapped and scrolled rows", async () => {
+test("single textarea traverses wrapped and scrolled text before reaching the submit button", async () => {
   const { renderer, renderOnce } = await createTestRenderer({ width: 40, height: 24 })
   try {
-    const inputs = ["abcdefghijklmno\n第二行\n第三行", "next", "", "last"].map((text, i) => {
-      const input = new TextareaRenderable(renderer, { id: `field-${i}`, width: 8, height: 2, wrapMode: "char", initialValue: text })
-      renderer.root.add(input)
-      return input
-    })
+    const input = new TextareaRenderable(renderer, { id: "prompt", width: 8, height: 2, wrapMode: "char", initialValue: "abcdefghijklmno\n第二行\n第三行" })
+    renderer.root.add(input)
+    const inputs = [input]
     await renderOnce()
-    const first = inputs[0]!
-    first.focus(); first.gotoBufferHome()
-    expect(moveBetweenFields(inputs, 0, -1)).toBe(0)
-    expect(moveBetweenFields(inputs, 0, 1)).toBe(0)
-    expect(first.logicalCursor.row).toBe(0) // still inside a soft-wrapped logical line
-    expect(first.logicalCursor.col).toBeGreaterThan(0)
-    expect(moveBetweenFields(inputs, 0, 1)).toBe(0)
-    expect(first.logicalCursor.row).toBe(1)
-    first.gotoBufferEnd()
+    input.focus(); input.gotoBufferHome()
+    expect(moveBetweenFields(inputs, 0, -1, true)).toBe(0)
+    expect(moveBetweenFields(inputs, 0, 1, true)).toBe(0)
+    expect(input.logicalCursor.row).toBe(0)
+    expect(input.logicalCursor.col).toBeGreaterThan(0)
+    expect(moveBetweenFields(inputs, 0, 1, true)).toBe(0)
+    expect(input.logicalCursor.row).toBe(1)
+    input.gotoBufferEnd()
     await renderOnce()
-    expect(first.scrollY).toBeGreaterThan(0)
-    expect(moveBetweenFields(inputs, 0, -1)).toBe(0) // top visible row is not document top
-    first.gotoBufferEnd()
-    expect(moveBetweenFields(inputs, 0, 1)).toBe(1)
-    expect(inputs[1]!.cursorOffset).toBe(0)
-    expect(moveBetweenFields(inputs, 1, -1)).toBe(0)
-    expect(first.logicalCursor.row).toBe(2)
-    expect(moveBetweenFields(inputs, 2, 1)).toBe(3)
-    expect(moveBetweenFields(inputs, 3, 1)).toBe(3) // no wrap from final field to first
-    inputs[3]!.setText("第一行\n第二行")
-    inputs[3]!.gotoBufferHome()
-    expect(moveBetweenFields(inputs, 3, 1, true)).toBe(3) // still inside the final textarea
-    expect(moveBetweenFields(inputs, 3, 1, true)).toBe(4) // the submit button
-    expect(moveBetweenFields(inputs, 4, 1, true)).toBe(4)
-    expect(moveBetweenFields(inputs, 4, -1, true)).toBe(3)
-    expect(inputs[3]!.logicalCursor.row).toBe(1)
+    expect(input.scrollY).toBeGreaterThan(0)
+    expect(moveBetweenFields(inputs, 0, -1, true)).toBe(0)
+    input.gotoBufferEnd()
+    expect(moveBetweenFields(inputs, 0, 1, true)).toBe(1)
+    expect(moveBetweenFields(inputs, 1, 1, true)).toBe(1)
+    expect(moveBetweenFields(inputs, 1, -1, true)).toBe(0)
+    expect(input.logicalCursor.row).toBe(2)
+    input.setText("")
+    expect(moveBetweenFields(inputs, 0, 1, true)).toBe(1)
+    expect(moveBetweenFields(inputs, 1, -1, true)).toBe(0)
   } finally { renderer.destroy() }
 })
 

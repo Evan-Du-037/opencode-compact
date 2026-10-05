@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "../src/core.ts"
 import { test, expect } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -15,7 +16,7 @@ async function fixture() {
     message: async () => ({ data: { info: { id: "summary1", role: "assistant", summary: true, parentID: "compact1" }, parts: [] } }),
   } } } as any, { stateDir: root })
   const ready = await read<{ backend: string }>(pathFor(root, directory, "backend", "ready"))
-  const request: Request = { version: 2, id: "request1", directory, sessionID, created: Date.now(), base: fingerprint(base), fields: { focus: "下一阶段 GC", preserve: "刚刚那段", discard: "UI", extra: "新增背景" }, backend: ready!.backend }
+  const request: Request = { version: PROTOCOL_VERSION, id: "request1", directory, sessionID, created: Date.now(), base: fingerprint(base), fields: { instructions: "下一阶段 GC；保留刚刚那段原文，省略 UI。新增背景。" }, backend: ready!.backend }
   return { root, directory, sessionID, request, hooks, setMessages: (m: Message[]) => { messages = m }, messages,
     cleanup: async () => { await hooks.dispose?.(); await rm(root, { recursive: true, force: true }) } }
 }
@@ -44,7 +45,7 @@ test("single request replaces prompt, leaves model output untouched and does not
 test("blank form replaces prompt and carries previous summary and plugin context", async () => {
   const f = await fixture()
   try {
-    f.request.fields = { focus: " ", preserve: "\n", discard: "", extra: "\t" }
+    f.request.fields = { instructions: " \n\t" }
     f.messages.unshift({ info: { id: "old", role: "assistant", summary: true, finish: "stop" }, parts: [{ id: "old-text", type: "text", text: "之前已完成的工作" }] })
     f.request.base = fingerprint(f.messages.slice(0, -1))
     await publish(f.root, f.request)
@@ -116,7 +117,7 @@ for (const scenario of ["marker", "backend", "expired", "version"] as const) {
       if (scenario === "marker") f.messages.at(-1)!.parts = []
       if (scenario === "backend") f.request.backend = "different-instance"
       if (scenario === "expired") f.request.created = Date.now() - 11 * 60_000
-      if (scenario === "version") (f.request as any).version = 1
+      if (scenario === "version") (f.request as any).version = 2
       await publish(f.root, f.request)
       await expect(f.hooks["experimental.session.compacting"]!({ sessionID: f.sessionID }, { context: [] })).rejects.toThrow(expected)
       const receipt = await read<any>(pathFor(f.root, f.directory, f.sessionID, "receipt"))

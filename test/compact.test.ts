@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "../src/core.ts"
 import { test, expect } from "bun:test"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -11,7 +12,7 @@ for (const scenario of ["matching", "stale", "started", "unreadable"] as const) 
     const root = await mkdtemp(join(tmpdir(), "compact-submit-test-")), directory = "/fixture", sessionID = "ses_fixture"
     const original = new Error("unexpected server error")
     try {
-      await save(pathFor(root, directory, "backend", "ready"), { backend: "backend1", pid: process.pid, version: 2 })
+      await save(pathFor(root, directory, "backend", "ready"), { backend: "backend1", pid: process.pid, version: PROTOCOL_VERSION })
       const api = { state: { config: {} }, client: { session: {
         messages: async () => ({ data: [{ info: { id: "msg1", role: "user", model: { providerID: "mock", modelID: "test" } }, parts: [] }] }),
         get: async () => ({ data: {} }),
@@ -26,7 +27,7 @@ for (const scenario of ["matching", "stale", "started", "unreadable"] as const) 
         },
       } } }
       const error = await compactSession({ api: api as any, root, directory, sessionID,
-        fields: { focus: "", preserve: "", discard: "", extra: "" }, signal: new AbortController().signal }).catch(e => e)
+        fields: { instructions: "" }, signal: new AbortController().signal }).catch(e => e)
       if (scenario === "matching") {
         expect(error.message).toBe("具体校验错误")
         expect(error.cause).toBe(original)

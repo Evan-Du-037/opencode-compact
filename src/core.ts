@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto"
 
 export const PLUGIN_ID = "evan.compact-form"
-export type Fields = { focus: string; preserve: string; discard: string; extra: string }
+export const PROTOCOL_VERSION = 3
+export type Fields = { instructions: string }
 export type Message = {
   info: { id: string; role: string; summary?: boolean; agent?: string; parentID?: string; error?: unknown; finish?: string; model?: { providerID: string; modelID: string }; time?: { created: number } }
   parts: Array<{ id: string; type: string; text?: string; ignored?: boolean; synthetic?: boolean; auto?: boolean }>
 }
 export type Request = {
-  version: 2; id: string; directory: string; sessionID: string; created: number;
+  version: typeof PROTOCOL_VERSION; id: string; directory: string; sessionID: string; created: number;
   base: string; fields: Fields; backend: string
 }
 

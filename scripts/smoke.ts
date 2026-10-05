@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "../src/core.ts"
 import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -7,7 +8,8 @@ import { compactionInstructions, fingerprint, type Message, type Request } from 
 import { pathFor, publish, read } from "../src/store.ts"
 import { compactSession } from "../src/compact.ts"
 
-const hold = process.argv.includes("--hold")
+const native = process.argv.includes("--hold-native")
+const hold = native || process.argv.includes("--hold")
 const root = await mkdtemp(join(tmpdir(), "opencode-compact-smoke-"))
 const directory = join(root, "project"), configDir = join(root, "config", "opencode"), stateDir = join(root, "bridge")
 await mkdir(directory, { recursive: true }); await mkdir(configDir, { recursive: true })
@@ -73,11 +75,12 @@ try {
   const history = (await client.session.messages({ sessionID, directory })).data! as Message[]
   const ready = await waitFor(() => read<{ backend: string }>(pathFor(stateDir, directory, "backend", "ready")))
   if (hold) {
+    if (native) { child.kill(); await child.exited }
     await writeFile(join(root, "attach.json"), JSON.stringify({ url, sessionID, directory, env, root }))
     console.log(`HOLD ${join(root, "attach.json")}`)
     await new Promise<void>(resolvePromise => { process.on("SIGTERM", resolvePromise); process.on("SIGINT", resolvePromise) })
   } else {
-    const request: Request = { version: 2, id: crypto.randomUUID(), directory, sessionID, created: Date.now(), base: fingerprint(history), fields: { focus: "接下来只检查 GC 写放大", preserve: "最后的 GC 原文", discard: "UI", extra: "补充背景：下一阶段时间预算 30 分钟。" }, backend: ready.backend }
+    const request: Request = { version: PROTOCOL_VERSION, id: crypto.randomUUID(), directory, sessionID, created: Date.now(), base: fingerprint(history), fields: { instructions: "接下来只检查 GC 写放大，保留最后的 GC 原文，省略 UI。补充背景：下一阶段时间预算 30 分钟。" }, backend: ready.backend }
     const beforeCalls = requests.length
     await publish(stateDir, request)
     await client.session.summarize({ sessionID, directory, providerID: "mock", modelID: "test", auto: false })
@@ -100,7 +103,7 @@ try {
     assert(continuation.includes(mockSummary), "model summary missing from continuation")
     assert(!continuation.includes(JSON.stringify(await compactionInstructions(request.fields)).slice(1, -1)), "instructions leaked into normal continuation")
     const history2 = (await client.session.messages({ sessionID, directory })).data! as Message[]
-    const request2: Request = { ...request, id: crypto.randomUUID(), base: fingerprint(history2), created: Date.now(), fields: { focus: "第二次只检查测试", preserve: "", discard: "", extra: "" } }
+    const request2: Request = { ...request, id: crypto.randomUUID(), base: fingerprint(history2), created: Date.now(), fields: { instructions: "第二次只检查测试" } }
     const beforeSecond = requests.length
     await publish(stateDir, request2)
     await client.session.summarize({ sessionID, directory, providerID: "mock", modelID: "test", auto: false })
@@ -108,12 +111,13 @@ try {
     const second = JSON.stringify(requests.at(-1).messages)
     assert(second.includes("已有交接摘要（历史资料）"), "previous summary missing from repeated compaction")
     assert(second.includes(mockSummary), "previous model summary missing")
-    assert(!second.includes(request.fields.preserve), "previous preserve requirement leaked into next compaction")
+    assert(!second.includes(request.fields.instructions), "previous instructions leaked into next compaction")
     const fork = (await client.session.fork({ sessionID, directory })).data!
     await compactSession({ api: { client, state: { config: {} } } as any, root: stateDir, directory,
-      sessionID: fork.id, fields: { focus: "", preserve: "", discard: "", extra: "" }, signal: new AbortController().signal })
+      sessionID: fork.id, fields: { instructions: "" }, signal: new AbortController().signal })
     const blank = JSON.stringify(requests.at(-1).messages)
     assert(blank.includes("压缩后的内容必须自成一体"), "blank fork compaction lost general template requirements")
+    assert(!blank.includes("用户提示") && !blank.includes("未提供") && !blank.includes("未填写"), "blank compaction mentions user instructions")
     console.log("PASS: fork session with blank form completed through the TUI submission function")
     console.log("PASS: no picker agent, one model call, replacement prompt with history, unmodified model summary, continuation and repeated compaction")
     console.log(`Isolated test files: ${root}`)

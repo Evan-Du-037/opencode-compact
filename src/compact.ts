@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "./core.ts"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { randomUUID } from "node:crypto"
 import { fingerprint, visibleHistory, type Fields, type Message, type Request } from "./core.ts"
@@ -14,7 +15,7 @@ export async function compactSession({ api, root, directory, sessionID, fields, 
     const ready = await read<{ backend: string; pid: number; version: number }>(pathFor(root, directory, "backend", "ready"))
     if (!ready) throw new Error("压缩服务端插件尚未加载。请运行安装脚本并重启 OpenCode。")
     try { process.kill(ready.pid, 0) } catch { throw new Error("压缩服务端插件已退出，请重启 OpenCode。") }
-    if (ready.version !== 2) throw new Error("压缩服务端仍是旧版本，请完全退出并重启 OpenCode。")
+    if (ready.version !== PROTOCOL_VERSION) throw new Error("压缩服务端仍是旧版本，请完全退出并重启 OpenCode。")
     backend = ready.backend
     const pendingPath = pathFor(root, directory, sessionID, "pending")
     const pending = await read<Request>(pendingPath)
@@ -35,7 +36,7 @@ export async function compactSession({ api, root, directory, sessionID, fields, 
     }
     const statusResult = await api.client.session.status({ directory }, { throwOnError: true })
     if (statusResult.data?.[sessionID]?.type && statusResult.data[sessionID]!.type !== "idle") throw new Error("会话正在运行，请等待结束后重新压缩。")
-    request = { version: 2, id: randomUUID(), directory, sessionID, created: Date.now(), base: fingerprint(snapshot), fields, backend }
+    request = { version: PROTOCOL_VERSION, id: randomUUID(), directory, sessionID, created: Date.now(), base: fingerprint(snapshot), fields, backend }
     signal.throwIfAborted()
     await publish(root, request)
     signal.throwIfAborted()

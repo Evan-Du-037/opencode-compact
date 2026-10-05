@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import type { Fields } from "./core.ts"
 
-const keys = ["focus", "preserve", "discard", "extra"] as const
+const keys = ["instructions"] as const
 const defaultTemplate = new URL("../compact-prompt.md", import.meta.url)
 
 /** A small, non-evaluating template renderer. Inserted field text is never parsed as template syntax. */
