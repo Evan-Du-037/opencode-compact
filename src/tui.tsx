@@ -2,13 +2,14 @@
 import { createSignal, Show, onMount, onCleanup } from "solid-js"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { Plugin } from "@opencode/plugin/tui"
+type TuiPluginApi = Plugin.Context
 import { spawn } from "node:child_process"
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { PLUGIN_ID, type Fields } from "./core.ts"
-import { storeRoot } from "./store.ts"
+
 import { compactSession } from "./compact.ts"
 import { clearField, moveBetweenFields } from "./form-editing.ts"
 
@@ -34,50 +35,51 @@ async function edit(api: TuiPluginApi, fields: Fields) {
   }
 }
 
-export const tui: TuiPlugin = async (api, options) => {
-  const root = storeRoot(options)
+const tui = (api: TuiPluginApi) => {
   // Drafts belong to a session and live for this TUI process. Successful compaction consumes them.
   const drafts = new Map<string, Fields>()
   const inFlight = new Set<string>()
   let opened = false
-  const off = api.keymap.registerLayer({ priority: 100,
-    commands: [{ name: "session.compact", namespace: "palette", title: "Compact · 填写交接要求", slashName: "compact", slashAliases: ["summarize"], category: "Session", run() {
-      const route = api.route.current
-      if (route.name !== "session" || !route.params?.sessionID) { api.ui.toast({ title: "请先打开会话", message: "已有会话才能压缩。", variant: "warning" }); return }
+  api.keymap.layer(() => ({ priority: 100,
+    commands: [{ id: "session.compact", palette: true, title: "Compact · 填写交接要求", slash: { name: "compact", aliases: ["summarize"] }, group: "Session", bind: "ctrl+x c", run() {
+      const route = api.ui.router.current()
+      if (route.type !== "session") { api.ui.toast.show({ title: "请先打开会话", message: "已有会话才能压缩。", variant: "warning" }); return }
       if (opened) return
-      const sessionID = String(route.params.sessionID)
-      if (api.state.session.status(sessionID)?.type !== "idle" && api.state.session.status(sessionID)) { api.ui.toast({ title: "会话正在运行", message: "请等待本轮结束后再压缩。", variant: "warning" }); return }
-      const directory = resolve(api.state.path.directory)
+      const sessionID = route.sessionID
+      if (api.data.session.status(sessionID) !== "idle") { api.ui.toast.show({ title: "会话正在运行", message: "请等待本轮结束后再压缩。", variant: "warning" }); return }
+      const location = api.data.session.get(sessionID)?.location ?? api.location ?? api.data.location.default()
+      const directory = location.directory
       const draftKey = `${directory}\0${sessionID}`
-      if (inFlight.has(draftKey)) { api.ui.toast({ title: "压缩正在提交", message: "请等待本次压缩完成。", variant: "warning" }); return }
+      if (inFlight.has(draftKey)) { api.ui.toast.show({ title: "压缩正在提交", message: "请等待本次压缩完成。", variant: "warning" }); return }
       opened = true
       let submitted = false
       const controller = new AbortController()
-      api.ui.dialog.setSize("large")
-      api.ui.dialog.replace(() => <Form api={api} controller={controller}
+      api.ui.dialog.show(() => <Form api={api} controller={controller}
         initial={drafts.get(draftKey) ?? empty} saveDraft={value => drafts.set(draftKey, { ...value })}
         submit={fields => {
           if (submitted) return
+          // Read the composer selection at submission, not the session's persisted model.
+          const selected = api.ui.model.current()
+          const model = selected ? { providerID: selected.providerID, id: selected.modelID, variant: selected.variant } : undefined
           submitted = true
           drafts.set(draftKey, { ...fields })
           inFlight.add(draftKey)
           api.ui.dialog.clear()
-          void compactSession({ api, root, directory, sessionID, fields: { ...fields }, signal: controller.signal })
+          void compactSession({ client: api.client, location, sessionID, fields: { ...fields }, model, signal: controller.signal })
             .then(() => {
               drafts.delete(draftKey)
-              api.ui.toast({ title: "压缩完成", message: "本次压缩已完成。", variant: "success" })
+              api.ui.toast.show({ title: "压缩完成", message: "本次压缩已完成。", variant: "success" })
             })
-            .catch(error => api.ui.toast({ title: "压缩未完成", message: `${error instanceof Error ? error.message : String(error)} 草稿已保留，可重新打开 /compact。`, variant: "error" }))
+            .catch(error => api.ui.toast.show({ title: "压缩未完成", message: `${error instanceof Error ? error.message : String(error)} 草稿已保留，可重新打开 /compact。`, variant: "error" }))
             .finally(() => inFlight.delete(draftKey))
         }} />, () => { opened = false; if (!submitted) controller.abort() })
     } }],
-  })
-  api.lifecycle.onDispose(off)
+  }))
 }
 
 function Form(props: { api: TuiPluginApi; controller: AbortController; initial: Fields; saveDraft: (fields: Fields) => void; submit: (fields: Fields) => void }) {
   const { api, controller } = props
-  const theme = api.theme.current, dimensions = useTerminalDimensions()
+  const theme = api.theme, dimensions = useTerminalDimensions()
   const [fields, setFields] = createSignal<Fields>({ ...props.initial })
   const [step, setStep] = createSignal<"form" | "editor">("form")
   const [error, setError] = createSignal("")
@@ -109,58 +111,52 @@ function Form(props: { api: TuiPluginApi; controller: AbortController; initial: 
   const confirm = () => { if (step() === "form") { capture(); props.submit({ ...fields() }) } }
 
   onMount(() => {
+    api.ui.dialog.set({ size: "large", centered: true })
     setTimeout(() => focus(0), 10)
-    const off = api.keymap.registerLayer({ priority: 1000, mode: "modal", commands: [
-      { name: "compact-form.next", run: () => { if (step() === "form") focus(focusIndex + 1) } },
-      { name: "compact-form.prev", run: () => { if (step() === "form") focus(focusIndex - 1) } },
-      { name: "compact-form.up", run: () => { if (step() !== "form") return false; move(-1) } },
-      { name: "compact-form.down", run: () => { if (step() !== "form") return false; move(1) } },
-      { name: "compact-form.clear", run: () => { if (step() === "form") clearField(inputs[focusIndex]) } },
-      { name: "compact-form.undo", run: () => { if (step() === "form") inputs[focusIndex]?.undo() } },
-      { name: "compact-form.enter", run: () => { if (step() === "form") { if (buttonFocused()) confirm(); else inputs[focusIndex]?.newLine() } } },
-      { name: "compact-form.confirm", run: confirm }, { name: "compact-form.cancel", run: cancel },
-      { name: "compact-form.editor", run: () => void openEditor() },
-    ], bindings: [
-      { key: "tab", cmd: "compact-form.next" }, { key: "shift+tab", cmd: "compact-form.prev" },
-      { key: "up", cmd: "compact-form.up" }, { key: "down", cmd: "compact-form.down" },
-      { key: "ctrl+c", cmd: "compact-form.clear" }, { key: "ctrl+z", cmd: "compact-form.undo" },
-      { key: "return", cmd: "compact-form.enter" },
-      { key: "ctrl+s", cmd: "compact-form.confirm" }, { key: "ctrl+return", cmd: "compact-form.confirm" },
-      { key: "escape", cmd: "compact-form.cancel" }, { key: "ctrl+e", cmd: "compact-form.editor" },
-    ] })
-    onCleanup(off)
   })
+  api.keymap.layer(() => ({ priority: 1000, mode: "modal", commands: [
+      { bind: "tab", run: () => { if (step() === "form") focus(focusIndex + 1) } },
+      { bind: "shift+tab", run: () => { if (step() === "form") focus(focusIndex - 1) } },
+      { bind: "up", run: () => move(-1) }, { bind: "down", run: () => move(1) },
+      { bind: "ctrl+c", run: () => { if (step() === "form") clearField(inputs[focusIndex]) } },
+      { bind: "ctrl+z", run: () => { if (step() === "form") inputs[focusIndex]?.undo() } },
+      { bind: "return", run: () => { if (step() === "form") { if (buttonFocused()) confirm(); else inputs[focusIndex]?.newLine() } } },
+      { bind: "ctrl+s", run: confirm }, { bind: "ctrl+return", run: confirm },
+      { bind: "escape", run: cancel }, { bind: "ctrl+e", run: () => void openEditor() },
+  ] }))
   onCleanup(() => {
     // Read signal state here: child textareas may already have been destroyed by Solid.
     props.saveDraft(fields())
   })
 
   return <box paddingLeft={2} paddingRight={2} paddingBottom={1} gap={dimensions().height < 30 ? 0 : 1}>
-    <text fg={theme.primary}><b>Compact · 本次交接要求</b></text>
-    <Show when={error()}><text fg={theme.error} wrapMode="word">{error()}</text></Show>
+    <text fg={theme.text.action.primary.base}><b>Compact · 本次交接要求</b></text>
+    <Show when={error()}><text fg={theme.text.feedback.error.base} wrapMode="word">{error()}</text></Show>
     <Show when={step() === "form"}>
       <box gap={0}>
-        <text fg={theme.text}>本次压缩提示（可留空）</text>
-        <box backgroundColor={theme.backgroundElement}>
+        <box border borderStyle="rounded"
+          borderColor={buttonFocused() ? theme.text.muted : theme.text.action.primary.base}
+          title=" 本次压缩提示（可留空） " titleColor={theme.text.base} titleAlignment="left"
+          paddingLeft={1} paddingRight={1} backgroundColor={theme.background.raised.base}>
           <textarea ref={(ref: TextareaRenderable) => { inputs[0] = ref }} initialValue={fields().instructions}
-            height={Math.max(2, Math.min(16, Math.floor(dimensions().height * 0.72 - 9)))}
+            height={Math.max(2, Math.min(15, Math.floor(dimensions().height * 0.72 - 10)))}
             placeholder="直接写下本次压缩的要求；留空则使用通用压缩要求。"
-            textColor={theme.text} focusedTextColor={theme.text} placeholderColor={theme.textMuted} cursorColor={theme.primary}
+            textColor={theme.text.base} focusedTextColor={theme.text.base} placeholderColor={theme.text.muted} cursorColor={theme.text.action.primary.base}
             onContentChange={() => { const input = inputs[0]; if (input) setFields({ instructions: input.plainText }) }}
             onMouseDown={() => { focusIndex = 0; setButtonFocused(false) }} />
         </box>
       </box>
-      <text fg={theme.textMuted}>末行 ↓ 到按钮 · Tab 切换 · Ctrl+C 清空 · Ctrl+Z 撤销</text>
-      <text fg={theme.textMuted}>Enter 换行/提交 · Ctrl+E 编辑器 · Ctrl+S 确认 · Esc 保存草稿并关闭</text>
+      <text fg={theme.text.muted}>末行 ↓ 到按钮 · Tab 切换 · Ctrl+C 清空 · Ctrl+Z 撤销</text>
+      <text fg={theme.text.muted}>Enter 换行/提交 · Ctrl+E 编辑器 · Ctrl+S 确认 · Esc 保存草稿并关闭</text>
       <box flexDirection="row" gap={3}>
-        <text fg={theme.primary} onMouseUp={confirm}>{buttonFocused() ? "▶ [ 开始压缩 ]" : "[ 开始压缩 ]"}</text>
+        <text fg={theme.text.action.primary.base} onMouseUp={confirm}>{buttonFocused() ? "▶ [ 开始压缩 ]" : "[ 开始压缩 ]"}</text>
       </box>
     </Show>
     <Show when={step() === "editor"}>
-      <text fg={theme.text}>等待编辑器…</text>
-      <text fg={theme.textMuted}>保存退出编辑器后返回表单</text>
+      <text fg={theme.text.base}>等待编辑器…</text>
+      <text fg={theme.text.muted}>保存退出编辑器后返回表单</text>
     </Show>
   </box>
 }
 
-export default { id: `${PLUGIN_ID}.tui`, tui } satisfies TuiPluginModule
+export default Plugin.define({ id: `${PLUGIN_ID}.tui`, setup: tui })

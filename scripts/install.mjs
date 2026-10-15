@@ -26,44 +26,44 @@ async function config(name) {
   }
   return { file: join(configDir, name + '.json'), text: '{}\n', exists: false }
 }
-function decode(entry) { return Array.isArray(entry) ? entry[0] : entry }
+function decode(entry) { return Array.isArray(entry) ? entry[0] : typeof entry === 'object' && entry ? entry.package : entry }
 const changes = []
-for (const [name, module] of [['opencode', 'server.ts'], ['tui', 'tui.tsx']]) {
+const spec = pathToFileURL(root).href
+function matches(entry) {
+  const text = decode(entry)
+  if (typeof text !== 'string') return false
+  try {
+    const path = text.startsWith('file:') ? fileURLToPath(text) : resolve(configDir, text)
+    return [root, join(root, 'src/server.ts'), join(root, 'src/tui.tsx')].includes(path)
+  } catch { return false }
+}
+for (const name of ['opencode', 'cli', 'tui']) {
   const primary = await config(name)
   const alternateFile = join(configDir, name + (primary.file.endsWith('.jsonc') ? '.json' : '.jsonc'))
   const alternateText = await optional(alternateFile)
   const items = [primary, ...(alternateText === undefined ? [] : [{ file: alternateFile, text: alternateText, exists: true }])]
   let installed = false
   for (const item of items) {
-  const errors = []
-  const value = parse(item.text, errors, { allowTrailingComma: true })
-  if (errors.length || !value || Array.isArray(value) || typeof value !== 'object') throw new Error(`${item.file} 不是有效 JSON/JSONC；未写入配置。`)
-  if (value.plugin !== undefined && !Array.isArray(value.plugin)) throw new Error(`${item.file} 的 plugin 必须是数组。`)
-  const spec = pathToFileURL(join(root, 'src', module)).href
-  const matches = entry => {
-    const text = decode(entry)
-    if (typeof text !== 'string') return false
-    try { return (text.startsWith('file:') ? fileURLToPath(text) : resolve(configDir, text)) === join(root, 'src', module) } catch { return false }
+    const errors = [], value = parse(item.text, errors, { allowTrailingComma: true })
+    if (errors.length || !value || Array.isArray(value) || typeof value !== 'object') throw new Error(`${item.file} 不是有效 JSON/JSONC；未写入配置。`)
+    let next = item.text
+    for (const key of ['plugin', 'plugins']) {
+      if (value[key] !== undefined && !Array.isArray(value[key])) throw new Error(`${item.file} 的 ${key} 必须是数组。`)
+      if (check) { if (name === 'opencode' && key === 'plugins') installed ||= (value[key] || []).some(entry => decode(entry) === spec); continue }
+      const entries = (value[key] || []).filter(entry => !matches(entry))
+      if (!uninstall && name === 'opencode' && key === 'plugins' && item === primary) entries.push({ package: spec })
+      if (JSON.stringify(entries) === JSON.stringify(value[key] || [])) continue
+      next = applyEdits(next, modify(next, [key], entries.length ? entries : undefined, { formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\n' } }))
+    }
+    if (next !== item.text && (!uninstall || item.exists)) changes.push({ ...item, next })
   }
-  if (check) {
-    installed ||= (value.plugin || []).some(matches)
-    continue
-  }
-  const plugins = (value.plugin || []).filter(entry => !matches(entry))
-  if (!uninstall && item === primary) plugins.push([spec, { stateDir: join(configDir, '.compact-form-state') }])
-  if (uninstall && plugins.length === (value.plugin || []).length) continue
-  if (item !== primary && plugins.length === (value.plugin || []).length) continue
-  const next = applyEdits(item.text, modify(item.text, ['plugin'], plugins, { formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\n' } }))
-  if (next !== item.text && (!uninstall || item.exists)) changes.push({ ...item, next })
-  }
-  if (check) {
-    console.log(`${name}: ${installed ? '已配置' : '未配置'}`)
+  if (check && name === 'opencode') {
+    console.log(`v2 server + tui: ${installed ? '已配置' : '未配置'}`)
     if (!installed) process.exitCode = 1
   }
 }
 if (!check) {
   await mkdir(configDir, { recursive: true })
-  if (!uninstall) await mkdir(join(configDir, '.compact-form-state'), { recursive: true, mode: 0o700 })
   const stamp = new Date().toISOString().replaceAll(':', '-'), written = []
   try {
     for (const change of changes) {
@@ -81,7 +81,7 @@ if (!check) {
   } finally {
     for (const change of changes) await unlink(`${change.file}.compact-tmp`).catch(() => {})
   }
-  console.log(uninstall ? '已移除本插件的两项配置。其他插件和设置保持原样。' : '安装完成。请完全退出并重新启动 OpenCode，然后在已有会话输入 /compact。')
+  console.log(uninstall ? '已移除本插件的配置。其他插件和设置保持原样。' : '安装完成。请运行 opencode reload，并关闭后重新打开终端界面，然后在已有会话输入 /compact。')
   console.log(`配置目录：${configDir}`)
   if (changes.some(c => c.exists)) console.log(`已有配置备份后缀：.bak-compact-${stamp}`)
 }

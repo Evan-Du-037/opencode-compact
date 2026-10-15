@@ -5,13 +5,13 @@ command -v node >/dev/null || { echo '需要 Node.js（用于安全编辑 JSONC 
 command -v npm >/dev/null || { echo '需要 npm。' >&2; exit 1; }
 if [[ " ${*:-} " != *' --uninstall '* && " ${*:-} " != *' --check '* ]]; then
   command -v opencode >/dev/null || { echo '未找到 opencode。' >&2; exit 1; }
-  COMPACT_VERSION="$(opencode --version)"
-  if [[ "$COMPACT_VERSION" != '1.18.34' && " ${*:-} " != *' --allow-untested '* ]]; then
-    echo "当前 OpenCode 为 $COMPACT_VERSION；此插件针对 1.18.34 验证。要自行测试其他 1.x 版本，请加 --allow-untested。" >&2
+  COMPACT_VERSION="$(opencode --version | sed 's/^opencode v//')"
+  if [[ "$COMPACT_VERSION" != '2.0.26' && " ${*:-} " != *' --allow-untested '* ]]; then
+    echo "当前 OpenCode 为 $COMPACT_VERSION；此插件针对 2.0.26 验证。要自行测试其他 2.x 版本，请加 --allow-untested。" >&2
     exit 1
   fi
-  if [[ "$COMPACT_VERSION" != 1.* ]]; then
-    echo '不支持 OpenCode 2.x；请勿把 v1 插件装入 v2。' >&2; exit 1
+  if [[ "$COMPACT_VERSION" != 2.* ]]; then
+    echo '此版本仅支持 OpenCode 2.x。' >&2; exit 1
   fi
 fi
 cd -- "$COMPACT_ROOT"

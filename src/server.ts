@@ -1,107 +1,78 @@
-import { PROTOCOL_VERSION } from "./core.ts"
+import { Plugin } from "@opencode/plugin"
+import { realpath } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
-import { resolve } from "node:path"
-import type { Plugin, PluginModule } from "@opencode-ai/plugin"
-import { compactionInstructions, fingerprint, previousHandoff, PLUGIN_ID, type Message, type Request } from "./core.ts"
-import { read, save, remove, pathFor, storeRoot, canonical } from "./store.ts"
+import { compactRpc, type CompactInput } from "./rpc.ts"
+import { compactionInstructions } from "./prompt.ts"
+import { PLUGIN_ID } from "./core.ts"
 
-type SharedState = {
-  backend: string
-  owners: number
-  ready: Promise<void>
-  active: Map<string, { request: Request; parentID: string; received: boolean }>
-}
-// Native TUI startup can load the server plugin through multiple Effect runtimes
-// in the same worker. Each registration must use the same identity and receipts.
-const registryKey = Symbol.for("evan.compact-form.server-state.v3")
-const globals = globalThis as typeof globalThis & { [registryKey]?: Map<string, SharedState> }
-const states = globals[registryKey] ??= new Map<string, SharedState>()
-
-export const server: Plugin = async ({ client, directory }, options) => {
-  const root = storeRoot(options)
-  const ready = pathFor(root, directory, "backend", "ready")
-  const key = JSON.stringify([canonical(root), canonical(directory)])
-  let state = states.get(key)
-  if (!state) {
-    const backend = randomUUID()
-    state = { backend, owners: 0, active: new Map(), ready: save(ready, { backend, pid: process.pid, directory: resolve(directory), version: PROTOCOL_VERSION }) }
-    states.set(key, state)
-  }
-  const shared = state
-  shared.owners++
-  try { await shared.ready } catch (error) {
-    if (--shared.owners === 0 && states.get(key) === shared) states.delete(key)
-    throw error
-  }
-  const { backend, active } = shared
-  let disposed = false
-  async function receipt(request: Request, status: string, error?: string) {
-    await save(pathFor(root, directory, request.sessionID, "receipt"), { id: request.id, status, error, time: Date.now() })
-  }
-  return {
-    "experimental.session.compacting": async ({ sessionID }, output) => {
-      const file = pathFor(root, directory, sessionID, "pending")
-      const request = await read<Request>(file)
-      if (!request) return
-      const response = await client.session.messages({ path: { id: sessionID }, query: { directory }, throwOnError: true })
-      const messages = response.data as Message[]
-      const parent = messages.at(-1)
-      const marker = parent?.parts.find(p => p.type === "compaction")
-      // Automatic compaction must not consume a request awaiting explicit confirmation.
-      if (marker?.auto) return
-      try {
-        if (!marker || !parent) throw new Error("未找到本次压缩标记，会话可能在提交期间发生变化。请重新打开 /compact。")
-        if (request.version !== PROTOCOL_VERSION) throw new Error("压缩表单与服务端插件版本不一致，请完全退出并重启 OpenCode。")
-        if (request.backend !== backend) throw new Error("压缩请求连接到了不同的服务端实例。请检查是否同时打开了同一项目的多个 OpenCode，再重启当前实例。")
-        if (request.sessionID !== sessionID) throw new Error("压缩请求的会话不匹配，请在目标会话重新打开 /compact。")
-        if (canonical(request.directory) !== canonical(directory)) throw new Error("压缩请求的项目目录不匹配，请在目标项目重新打开 /compact。")
-        if (!Number.isFinite(request.created) || Date.now() - request.created > 10 * 60_000) throw new Error("压缩请求已超过 10 分钟，请重新打开 /compact 后提交。")
-        if (fingerprint(messages.slice(0, -1)) !== request.base) throw new Error("填写期间会话已变化，请重新打开 /compact。")
-        const instructions = await compactionInstructions(request.fields, typeof options?.templatePath === "string" ? options.templatePath : undefined)
-        if (instructions) {
-          const previous = previousHandoff(messages.slice(0, -1))
-          // Replace the fixed prompt. OpenCode appends its selected conversation history itself.
-          output.prompt = [instructions, previous && `已有交接摘要（历史资料）：\n${previous}`, ...output.context].filter(Boolean).join("\n\n")
-          output.context.length = 0
-        }
-        active.set(sessionID, { request, parentID: parent.info.id, received: false })
-        await receipt(request, "started")
-      } catch (error) {
-        await receipt(request, "error", String(error))
-        throw error
-      } finally { await remove(file) }
-    },
-    "experimental.text.complete": async ({ sessionID, messageID }, output) => {
-      const item = active.get(sessionID)
-      if (!item || item.received) return
-      const response = await client.session.message({ path: { id: sessionID, messageID }, query: { directory }, throwOnError: true })
-      const message = response.data as Message
-      if (!message.info.summary || message.info.parentID !== item.parentID) return
-      item.received = Boolean(output.text.trim())
-    },
-    event: async ({ event }) => {
-      const e = event as { type: string; properties: { sessionID?: string; error?: unknown } }
-      const sessionID = e.properties.sessionID
-      if (!sessionID) return
-      const item = active.get(sessionID)
-      if (!item) return
-      if (e.type === "session.compacted") {
-        await receipt(item.request, item.received ? "done" : "error", item.received ? undefined : "模型未返回可保存的摘要文本。")
-        active.delete(sessionID)
-      } else if (e.type === "session.error") {
-        await receipt(item.request, "error", JSON.stringify(e.properties.error))
-        active.delete(sessionID)
+/** RPC and hooks live in the same v2 location; no filesystem rendezvous or backend IDs. */
+export default Plugin.define({
+  id: PLUGIN_ID,
+  async setup(ctx) {
+    const pending = new Map<string, { id: string; prompt: string; model?: CompactInput["model"]; used: boolean; controller: AbortController; error?: string }>()
+    const automatic = new Set<AbortController>()
+    const templatePath = typeof ctx.options.templatePath === "string" ? ctx.options.templatePath : undefined
+    const hook = await ctx.session.hook("compaction", async request => {
+      const history = await ctx.session.context({ sessionID: request.sessionID })
+      const marker = history.findLast(message => message.type === "compaction" && message.status === "running")
+      // v2.0.26 opens a manual record before the hook, but an automatic record AFTER it.
+      // No running marker therefore means automatic/overflow compaction, even with a manual RPC queued.
+      const manual = marker?.reason === "manual"
+      const task = manual ? pending.get(request.sessionID) : undefined
+      if (manual && (!task || marker.id !== task.id)) return
+      if (task?.used) throw new Error("本次压缩请求已执行。")
+      if (task) task.used = true
+      const controller = task?.controller ?? new AbortController()
+      const monitor = task ? undefined : new AbortController()
+      if (monitor) {
+        automatic.add(controller)
+        // A stopped runner must also cancel its transient automatic-summary request.
+        void ctx.session.wait({ sessionID: request.sessionID }, { signal: monitor.signal })
+          .then(() => { if (!monitor.signal.aborted) controller.abort() })
+          .catch(() => {})
       }
-    },
-    dispose: async () => {
-      if (disposed) return
-      disposed = true
-      if (--shared.owners > 0) return
-      if (states.get(key) === shared) states.delete(key)
-      if ((await read<{ backend: string }>(ready))?.backend === backend) await remove(ready)
-      for (const { request } of active.values()) await receipt(request, "error", "OpenCode 已关闭，压缩未确认完成。")
-      active.clear()
-    },
-  }
-}
-export default { id: `${PLUGIN_ID}.server`, server } satisfies PluginModule
+      try {
+        const prompt = task?.prompt ?? await compactionInstructions({ instructions: "" }, templatePath)
+        // v2 appends a hard-coded template after hooks. Supplying result skips that call.
+        // Automatic compaction uses only the template's general requirements, never manual drafts.
+        const result = await ctx.generate.text({ model: task?.model ?? request.model, prompt: `${prompt}\n\n<conversation-history>\n${JSON.stringify(request.messages)}\n</conversation-history>` }, { signal: controller.signal })
+        if (!result.text.trim()) throw new Error("模型返回了空摘要。")
+        request.result = { summary: result.text }
+      } catch (error) {
+        if (task) task.error = error instanceof Error ? error.message : String(error)
+        throw error
+      } finally {
+        monitor?.abort()
+        if (!task) { controller.abort(); automatic.delete(controller) }
+      }
+    })
+    const rpc = await ctx.rpc.register(compactRpc, {
+      async compact(value) {
+        const { sessionID, instructions, model } = value as CompactInput
+        if (pending.has(sessionID)) return { ok: false, error: "此会话已有压缩请求，请等待完成。" }
+        const task = { id: `msg_${randomUUID().replaceAll("-", "")}`, prompt: "", model, used: false, controller: new AbortController(), error: undefined as string | undefined }
+        pending.set(sessionID, task)
+        try {
+          const session = await ctx.session.get({ sessionID })
+          if (await realpath(session.location.directory) !== await realpath(ctx.location.directory))
+            throw new Error("当前会话所属目录与插件实例不一致，请重新打开该会话后重试。")
+          task.prompt = await compactionInstructions({ instructions }, templatePath)
+          // Like native TUI compaction, commit the composer selection before admission.
+          // If this fails, do not silently compact with the old model.
+          if (model) await ctx.session.switchModel({ sessionID, model })
+          const admitted = await ctx.session.compact({ sessionID, id: task.id })
+          if (admitted.id !== task.id) throw new Error("压缩请求与已有请求合并，请等待已有压缩完成后重试。")
+          await ctx.session.wait({ sessionID })
+          const history = await ctx.session.context({ sessionID })
+          const message = history.find(item => item.id === task.id)
+          if (message?.type !== "compaction" || message.status !== "completed" || !task.used)
+            throw new Error(task.error || (message?.type === "compaction" && message.status === "failed" ? message.error.message : "未找到本次自定义压缩的完成记录。"))
+          return { ok: true }
+        } catch (error) {
+          return { ok: false, error: task.error || (error instanceof Error ? error.message : String(error)) }
+        } finally { task.controller.abort(); pending.delete(sessionID) }
+      },
+    })
+    return async () => { for (const controller of automatic) controller.abort(); for (const task of pending.values()) task.controller.abort(); await rpc.dispose(); await hook.dispose() }
+  },
+})

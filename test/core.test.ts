@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test"
 import { readFile } from "node:fs/promises"
-import { compactionInstructions, fingerprint, previousHandoff, visibleHistory, type Message } from "../src/core.ts"
+import { compactionInstructions } from "../src/core.ts"
 
 test("empty and whitespace-only forms retain general requirements and omit the user block", async () => {
   const template = await readFile(new URL("../compact-prompt.md", import.meta.url), "utf8")
@@ -17,19 +17,4 @@ test("editable template inserts a free-form prompt literally", async () => {
   expect(prompt).toContain(instructions)
   expect(prompt).not.toContain("{{#instructions}}")
   expect(prompt).not.toContain("{{/instructions}}")
-})
-test("history snapshot detects edits and excludes reverted messages", () => {
-  const messages: Message[] = [{ info: { id: "m1", role: "user" }, parts: [{ id: "p1", type: "text", text: "old" }] }]
-  expect(visibleHistory(messages, "m1")).toEqual([])
-  const changed = structuredClone(messages); changed[0]!.parts[0]!.text = "new"
-  expect(fingerprint(changed)).not.toBe(fingerprint(messages))
-})
-test("only the latest successful previous summary is carried forward", () => {
-  const messages: Message[] = [
-    { info: { id: "m1", role: "assistant", summary: true, finish: "stop" }, parts: [{ id: "p1", type: "text", text: "上一轮交接" }] },
-    { info: { id: "m2", role: "assistant", summary: true, finish: "stop", error: {} }, parts: [{ id: "p2", type: "text", text: "失败摘要" }] },
-    { info: { id: "m3", role: "assistant", summary: true }, parts: [{ id: "p3", type: "text", text: "尚未完成" }] },
-  ]
-  expect(previousHandoff(messages)).toBe("上一轮交接")
-  expect(previousHandoff([])).toBeUndefined()
 })

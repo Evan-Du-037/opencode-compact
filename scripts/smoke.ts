@@ -1,132 +1,108 @@
-import { PROTOCOL_VERSION } from "../src/core.ts"
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { compactionInstructions, fingerprint, type Message, type Request } from "../src/core.ts"
-import { pathFor, publish, read } from "../src/store.ts"
+import { OpenCode } from "@opencode/client"
 import { compactSession } from "../src/compact.ts"
-
-const native = process.argv.includes("--hold-native")
-const hold = native || process.argv.includes("--hold")
-const root = await mkdtemp(join(tmpdir(), "opencode-compact-smoke-"))
-const directory = join(root, "project"), configDir = join(root, "config", "opencode"), stateDir = join(root, "bridge")
+const root = await mkdtemp(join(tmpdir(), "compact-v2-"))
+const directory = join(root, "project"), configDir = join(root, "config/opencode")
 await mkdir(directory, { recursive: true }); await mkdir(configDir, { recursive: true })
 const requests: any[] = []
-const mockSummary = "测试摘要：已确定 GC 触发条件，下一步检查写放大。"
-const modelServer = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
-  if (!req.url.includes("chat/completions")) return Response.json({ data: [{ id: "test", object: "model" }] })
+const requestPaths: string[] = []
+const auto = process.argv.includes("--auto")
+const promptTokens = auto ? 31000 : 200
+const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
   const body = await req.json() as any
   requests.push(body)
-  let text = "验证结果：GC 在 free_blocks < 7 时触发。\n\n必须逐字保留：A  B\r\n中文🙂。"
-  const isCompaction = body.messages.some((m: any) => m.role === "system" && String(m.content).includes("You are a context summarization agent"))
-  if (isCompaction) text = mockSummary
-  if (process.argv.includes("--slow") && isCompaction) await Bun.sleep(8000)
+  requestPaths.push(new URL(req.url).pathname)
+  await writeFile(join(root, "requests.json"), JSON.stringify(requests, null, 2))
+  const compact = JSON.stringify(body).includes("会话压缩指南")
+  if(compact && process.argv.includes("--fail")) return Response.json({error:{message:"fixture generation rejected"}},{status:400})
+  const text = compact ? "测试摘要：GC 在 free_blocks < 7 时触发；下一步检查写放大。" : "## Objective\n验证 GC 原文 A  B 中文🙂。"
   const id = `chatcmpl-${Date.now()}`
-  if (!body.stream) return Response.json({ id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: "test", choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }], usage: { prompt_tokens: 200, completion_tokens: 50, total_tokens: 250 } })
-  const chunks = [
-    { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "test", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
-    { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "test", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 200, completion_tokens: 50, total_tokens: 250 } },
-  ]
-  return new Response(chunks.map(c => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+  if (!body.stream) return Response.json({ id, object: "chat.completion", created: 1, model: "test", choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }], usage: { prompt_tokens: promptTokens, completion_tokens: 30, total_tokens: promptTokens + 30 } })
+  return new Response(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "test", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "test", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: promptTokens, completion_tokens: 30, total_tokens: promptTokens + 30 } })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
 } })
 await writeFile(join(configDir, "opencode.json"), JSON.stringify({
-  "$schema": "https://opencode.ai/config.json", model: "mock/test", small_model: "mock/test", enabled_providers: ["mock"], share: "disabled", autoupdate: false,
-  plugin: [[pathToFileURL(resolve("src/server.ts")).href, { stateDir }]],
-  permission: { "*": "deny", task: "allow" }, compaction: { auto: false, prune: false },
-  agent: { "visible-test-helper": { mode: "subagent", description: "VISIBLE_HELPER_CONTROL", permission: { "*": "deny" } } },
-  provider: { mock: { npm: "@ai-sdk/openai-compatible", name: "Local test", options: { baseURL: `http://127.0.0.1:${modelServer.port}/v1`, apiKey: "local-test-only" }, models: { test: { name: "Local fixture", limit: { context: 128000, output: 2048 } } } } },
+  model: "mock/test", plugins: [{ package: pathToFileURL(resolve(".")).href }],
+  compaction: { auto, keep: { tokens: 0 } },
+  providers: {
+    mock: { name: "Local fixture", package: "@ai-sdk/openai-compatible", settings: { baseURL: `http://127.0.0.1:${model.port}/v1`, apiKey: "local-test" }, models: { test: { name: "Local fixture", limit: { context: auto ? 32000 : 128000, output: 2048 } } } },
+    selected: { name: "Selected fixture", package: "@ai-sdk/openai-compatible", settings: { baseURL: `http://127.0.0.1:${model.port}/selected/v1`, apiKey: "local-test" }, models: { replacement: { name: "Selected fixture", limit: { context: 128000, output: 2048 } } } },
+  },
 }))
-await writeFile(join(configDir, "tui.json"), JSON.stringify({ plugin: [[pathToFileURL(resolve("src/tui.tsx")).href, { stateDir }]] }))
-await writeFile(join(root, "models.json"), "{}")
-const env: Record<string, string> = {
-  PATH: process.env.PATH!, TERM: "xterm-256color", LANG: "en_US.UTF-8",
-  XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_STATE_HOME: join(root, "state"), XDG_CACHE_HOME: join(root, "cache"),
-  OPENCODE_TEST_HOME: root, OPENCODE_CONFIG_DIR: configDir, OPENCODE_TUI_CONFIG: join(configDir, "tui.json"), OPENCODE_DISABLE_PROJECT_CONFIG: "true",
-  OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_MODELS_PATH: join(root, "models.json"),
-  OPENCODE_DISABLE_CLAUDE_CODE: "true", OPENCODE_DISABLE_EXTERNAL_SKILLS: "true", OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "true",
-}
+const env = { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root,"config"), XDG_DATA_HOME: join(root,"data"), XDG_STATE_HOME: join(root,"state"), XDG_CACHE_HOME: join(root,"cache"), OPENCODE_CONFIG_DIR: configDir, OPENCODE_TEST_HOME: root, OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_AUTOUPDATE: "true" }
 const child = Bun.spawn(["opencode", "serve", "--hostname", "127.0.0.1", "--port", "0", "--print-logs"], { cwd: directory, env, stdout: "pipe", stderr: "pipe" })
 let logs = ""
-async function consume(stream: ReadableStream<Uint8Array>) {
-  const reader = stream.getReader()
-  while (true) { const chunk = await reader.read(); if (chunk.done) break; logs += new TextDecoder().decode(chunk.value) }
-}
-void consume(child.stdout); void consume(child.stderr)
-async function waitFor<T>(fn: () => Promise<T | undefined>, timeout = 45000): Promise<T> {
-  const start = Date.now()
-  while (Date.now() - start < timeout) { const result = await fn(); if (result !== undefined) return result; await Bun.sleep(100) }
-  throw new Error(`Timed out. Logs: ${logs.slice(-5000)}`)
-}
-function assert(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message) }
+for (const stream of [child.stdout,child.stderr]) void (async () => { for await (const chunk of stream) { logs += new TextDecoder().decode(chunk); await writeFile(join(root,"server.log"),logs) } })()
+async function until<T>(f:()=>Promise<T|undefined>, ms=60000): Promise<T> { const deadline=Date.now()+ms; while(Date.now()<deadline){ const v=await f();if(v!==undefined)return v;await Bun.sleep(100) }throw new Error(logs.slice(-7000)) }
+function assert(v:unknown,msg:string):asserts v {if(!v)throw new Error(msg)}
+console.log("FIXTURE",root)
 try {
-  const url = await waitFor(async () => logs.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0])
-  const client = createOpencodeClient({ baseUrl: url, directory, throwOnError: true })
-  const session = (await client.session.create({ directory, title: "Compact integration fixture" })).data!
-  const sessionID = session.id
-  await client.session.prompt({ sessionID, directory, model: { providerID: "mock", modelID: "test" }, parts: [{ type: "text", text: "讨论 GC 触发条件，请回答测试原文。" }] })
-  const normalRequest = requests.find(r => JSON.stringify(r.tools).includes("task"))
-  assert(normalRequest, "task tool was not exposed in test fixture")
-  assert(JSON.stringify(normalRequest).includes("visible-test-helper"), "control subagent missing from model request")
-  assert(!JSON.stringify(normalRequest).includes("compact-quote-picker"), "internal picker leaked into model request")
-  const agents = (await client.app.agents({ directory })).data!
-  assert(!agents.some(a => a.name === "compact-quote-picker"), "removed picker still registered")
-  const history = (await client.session.messages({ sessionID, directory })).data! as Message[]
-  const ready = await waitFor(() => read<{ backend: string }>(pathFor(stateDir, directory, "backend", "ready")))
-  if (hold) {
-    if (native) { child.kill(); await child.exited }
-    await writeFile(join(root, "attach.json"), JSON.stringify({ url, sessionID, directory, env, root }))
-    console.log(`HOLD ${join(root, "attach.json")}`)
-    await new Promise<void>(resolvePromise => { process.on("SIGTERM", resolvePromise); process.on("SIGINT", resolvePromise) })
+ const url=await until(async()=>logs.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0])
+ const client=OpenCode.make({baseUrl:url,headers:{authorization:`Basic ${Buffer.from(`opencode:${logs.match(/server password (\S+)/)?.[1]}`).toString("base64")}`}})
+ console.log("SERVER",url)
+
+ await until(async()=>{ const p=await client.plugin.list({location:{directory}}); if(p.data.some(p=>p.id==="evan.compact-form" || p.state.status==="failed")){console.log("PLUGIN",JSON.stringify(p.data.filter(p=>p.id==="evan.compact-form")));return p} })
+ const session=await client.session.create({title:"Compact v2 smoke",location:{directory}})
+ await client.session.switchModel({sessionID:session.id,model:{providerID:"mock",id:"test"}})
+ await client.session.prompt({sessionID:session.id,text:"讨论 GC 触发条件，原文 A  B 中文🙂。"})
+ await client.session.wait({sessionID:session.id})
+ if(process.argv.includes("--model-switch")) {
+  assert((await client.session.get({sessionID:session.id})).model?.providerID==="mock","Expected original session provider")
+  const count=requests.length
+  // Simulate the uncommitted composer selection: no switchModel or ordinary prompt first.
+  await compactSession({client,location:{directory},sessionID:session.id,fields:{instructions:""},model:{providerID:"selected",id:"replacement"}})
+  assert(requests.length===count+1,"Expected exactly one summary call")
+  assert(requests[count].model==="replacement","Compaction used the old model")
+  assert(requestPaths[count]==="/selected/v1/chat/completions","Compaction used the old provider endpoint")
+  assert(JSON.stringify(requests[count]).includes("会话压缩指南"),"Custom prompt missing")
+  assert(!JSON.stringify(requests[count]).includes("用户提示"),"Blank user prompt section leaked")
+  const state=await client.session.get({sessionID:session.id})
+  assert(state.model?.providerID==="selected" && state.model.id==="replacement","Selected model was not committed")
+  const history=await client.session.context({sessionID:session.id})
+  assert(history.some(m=>m.type==="compaction"&&m.status==="completed"),"Compaction did not complete")
+  console.log("PASS direct compaction switches provider and model without a preceding message")
+ } else if(process.argv.includes("--fail") && !auto) {
+  const count=requests.length
+  try {await compactSession({client,location:{directory},sessionID:session.id,fields:{instructions:"failure test"}});throw new Error("Expected failure")}catch(error){assert(String(error).includes("fixture generation rejected"),String(error))}
+  assert(requests.length-count===1,"Failure fell back to native template")
+  console.log("PASS failure does not silently compact")
+ } else if(auto) {
+  await client.session.prompt({sessionID:session.id,text:"继续测试自动压缩。"})
+  await client.session.wait({sessionID:session.id})
+  const history=await client.session.context({sessionID:session.id})
+  const custom=requests.filter(r=>JSON.stringify(r).includes("会话压缩指南"))
+  assert(custom.length===1,"Expected one custom automatic summary")
+  assert(!JSON.stringify(custom[0]).includes("用户提示"),"Automatic compaction included user prompt section")
+  assert(!JSON.stringify(custom[0]).includes("You MUST use this format"),"Native template leaked")
+  if(process.argv.includes("--fail")) {
+    assert((await client.session.get({sessionID:session.id})).outcome==="failed","Failed automatic summary did not stop execution")
+    assert(!history.some(m=>m.type==="compaction"&&m.status==="completed"),"Failed automatic summary was persisted")
+    assert(requests.length===2,"Failed automatic summary silently fell back or continued")
+    console.log("PASS automatic failure preserves history without fallback")
   } else {
-    const request: Request = { version: PROTOCOL_VERSION, id: crypto.randomUUID(), directory, sessionID, created: Date.now(), base: fingerprint(history), fields: { instructions: "接下来只检查 GC 写放大，保留最后的 GC 原文，省略 UI。补充背景：下一阶段时间预算 30 分钟。" }, backend: ready.backend }
-    const beforeCalls = requests.length
-    await publish(stateDir, request)
-    await client.session.summarize({ sessionID, directory, providerID: "mock", modelID: "test", auto: false })
-    const receipt = await waitFor(async () => { const r = await read<any>(pathFor(stateDir, directory, sessionID, "receipt")); return r?.status === "done" || r?.status === "error" ? r : undefined })
-    assert(receipt.status === "done", `compaction failed: ${JSON.stringify(receipt)}`)
-    const after = (await client.session.messages({ sessionID, directory })).data!
-    const summary = after.findLast(m => m.info.role === "assistant" && m.info.summary)
-    assert(summary, "no persisted summary")
-    const text = summary.parts.filter(p => p.type === "text").map(p => p.text).join("\n")
-    assert(text === mockSummary, "plugin rewrote or appended content to model summary")
-    const compactRequests = requests.slice(beforeCalls)
-    assert(compactRequests.length === 1, `expected one compaction call, got ${compactRequests.length}`)
-    const compact = JSON.stringify(compactRequests[0].messages)
-    assert(compact.includes(JSON.stringify(await compactionInstructions(request.fields)).slice(1, -1)), "dynamic prompt missing")
-    assert(compact.includes("free_blocks < 7"), "native historical conversation missing")
-    assert(!compact.includes("Output exactly the Markdown structure shown inside <template>"), "default summary template still present")
-    assert(!(await client.session.children({ sessionID, directory })).data!.length, "unexpected child session")
-    await client.session.prompt({ sessionID, directory, model: { providerID: "mock", modelID: "test" }, parts: [{ type: "text", text: "继续。" }] })
-    const continuation = JSON.stringify(requests.at(-1))
-    assert(continuation.includes(mockSummary), "model summary missing from continuation")
-    assert(!continuation.includes(JSON.stringify(await compactionInstructions(request.fields)).slice(1, -1)), "instructions leaked into normal continuation")
-    const history2 = (await client.session.messages({ sessionID, directory })).data! as Message[]
-    const request2: Request = { ...request, id: crypto.randomUUID(), base: fingerprint(history2), created: Date.now(), fields: { instructions: "第二次只检查测试" } }
-    const beforeSecond = requests.length
-    await publish(stateDir, request2)
-    await client.session.summarize({ sessionID, directory, providerID: "mock", modelID: "test", auto: false })
-    assert(requests.length === beforeSecond + 1, "second compaction made extra calls")
-    const second = JSON.stringify(requests.at(-1).messages)
-    assert(second.includes("已有交接摘要（历史资料）"), "previous summary missing from repeated compaction")
-    assert(second.includes(mockSummary), "previous model summary missing")
-    assert(!second.includes(request.fields.instructions), "previous instructions leaked into next compaction")
-    const fork = (await client.session.fork({ sessionID, directory })).data!
-    await compactSession({ api: { client, state: { config: {} } } as any, root: stateDir, directory,
-      sessionID: fork.id, fields: { instructions: "" }, signal: new AbortController().signal })
-    const blank = JSON.stringify(requests.at(-1).messages)
-    assert(blank.includes("压缩后的内容必须自成一体"), "blank fork compaction lost general template requirements")
-    assert(!blank.includes("用户提示") && !blank.includes("未提供") && !blank.includes("未填写"), "blank compaction mentions user instructions")
-    console.log("PASS: fork session with blank form completed through the TUI submission function")
-    console.log("PASS: no picker agent, one model call, replacement prompt with history, unmodified model summary, continuation and repeated compaction")
-    console.log(`Isolated test files: ${root}`)
+    assert(history.some(m=>m.type==="compaction"&&m.reason==="auto"&&m.status==="completed"&&m.summary.includes("测试摘要")),"Custom automatic compaction did not complete")
+    assert(requests.length===3,"Agent did not resume after automatic compaction")
+    assert(JSON.stringify(requests.at(-1)).includes("测试摘要"),"Next model call did not receive the custom checkpoint")
+    console.log("PASS custom automatic compaction and agent continuation")
   }
-} finally {
-  child.kill()
-  const timeout = setTimeout(() => child.kill("SIGKILL"), 2000)
-  await child.exited; clearTimeout(timeout)
-  await writeFile(join(root, "model-requests.json"), JSON.stringify(requests, null, 2))
-  modelServer.stop(true)
-  await writeFile(join(root, "server.log"), logs)
-}
+ } else if(process.argv.includes("--hold") || process.argv.includes("--hold-native")) {
+  if(process.argv.includes("--hold-native")){child.kill();await child.exited}
+  await writeFile(join(root,"attach.json"),JSON.stringify({url,sessionID:session.id,directory,env,root}))
+  console.log("HOLD",join(root,"attach.json"))
+  await new Promise<void>(done=>{process.on("SIGTERM",done);process.on("SIGINT",done)})
+ } else {
+  for(const instructions of ["接下来检查 GC 写放大，保留原文。", "   "]){
+   const count=requests.length
+   await compactSession({client,location:{directory},sessionID:session.id,fields:{instructions}})
+   const compact=requests.slice(count).filter(r=>JSON.stringify(r).includes("会话压缩指南"))
+   assert(compact.length===1,`Expected one custom request: ${JSON.stringify(requests.slice(count))}`)
+   assert(!JSON.stringify(compact[0]).includes("You MUST use this format"),"Default prompt leaked")
+   assert(instructions.trim()?JSON.stringify(compact[0]).includes(instructions):!JSON.stringify(compact[0]).includes("## 用户提示"),"Conditional block failed")
+   console.log("PASS",instructions.trim()?"with instructions":"blank instructions")
+   await client.session.prompt({sessionID:session.id,text:"继续讨论 GC。"})
+   await client.session.wait({sessionID:session.id})
+  }
+ }
+} finally {child.kill();await child.exited;model.stop()}

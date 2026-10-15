@@ -1,38 +1,16 @@
-import { PROTOCOL_VERSION } from "../src/core.ts"
 import { test, expect } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { compactSession } from "../src/compact.ts"
-import { pathFor, save, read } from "../src/store.ts"
-import type { Request } from "../src/core.ts"
-
-for (const scenario of ["matching", "stale", "started", "unreadable"] as const) {
-  test(`summarize HTTP error uses only a matching error receipt: ${scenario}`, async () => {
-    const root = await mkdtemp(join(tmpdir(), "compact-submit-test-")), directory = "/fixture", sessionID = "ses_fixture"
-    const original = new Error("unexpected server error")
-    try {
-      await save(pathFor(root, directory, "backend", "ready"), { backend: "backend1", pid: process.pid, version: PROTOCOL_VERSION })
-      const api = { state: { config: {} }, client: { session: {
-        messages: async () => ({ data: [{ info: { id: "msg1", role: "user", model: { providerID: "mock", modelID: "test" } }, parts: [] }] }),
-        get: async () => ({ data: {} }),
-        status: async () => ({ data: {} }),
-        summarize: async () => {
-          const request = (await read<Request>(pathFor(root, directory, sessionID, "pending")))!
-          const file = pathFor(root, directory, sessionID, "receipt")
-          if (scenario === "unreadable") await writeFile(file, "invalid json")
-          else await save(file, { id: scenario === "stale" ? "old-request" : request.id,
-            status: scenario === "started" ? "started" : "error", error: "Error: 具体校验错误" })
-          throw original
-        },
-      } } }
-      const error = await compactSession({ api: api as any, root, directory, sessionID,
-        fields: { instructions: "" }, signal: new AbortController().signal }).catch(e => e)
-      if (scenario === "matching") {
-        expect(error.message).toBe("具体校验错误")
-        expect(error.cause).toBe(original)
-      } else expect(error).toBe(original)
-      expect(await read(pathFor(root, directory, sessionID, "pending"))).toBeUndefined()
-    } finally { await rm(root, { recursive: true, force: true }) }
-  })
-}
+test("v2 RPC carries literal text and location; errors retain server reason", async () => {
+ const calls: any[]=[]
+ const client:any={rpc:()=>({compact:async(...args:any[])=>{calls.push(args);return {ok:false,error:"具体错误"}}})}
+ await expect(compactSession({client,location:{directory:"/project"},sessionID:"s",fields:{instructions:"  原文\n"}})).rejects.toThrow("具体错误")
+ expect(calls[0][0]).toEqual({sessionID:"s",instructions:"  原文\n"})
+ expect(calls[0][1].location).toEqual({directory:"/project"})
+})
+test("RPC sends the selected provider, model, and variant without committing an ordinary prompt", async () => {
+ const calls: any[]=[]
+ const client:any={rpc:()=>({compact:async(...args:any[])=>{calls.push(args);return {ok:true}}})}
+ const model={providerID:"new-provider",id:"new-model",variant:"max"}
+ await compactSession({client,location:{directory:"/project"},sessionID:"s",fields:{instructions:""},model})
+ expect(calls[0][0]).toEqual({sessionID:"s",instructions:"",model})
+})
