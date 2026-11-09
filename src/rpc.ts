@@ -4,6 +4,21 @@ export type CompactInput = { sessionID: string; instructions: string; model?: Mo
 export const compactRpc = Rpc.define({
   id: "evan.compact-form.v2",
   methods: {
+    progress: {
+      input: { type: "object", properties: { sessionID: { type: "string" } }, required: ["sessionID"], additionalProperties: false },
+      output: { type: "object", properties: { progress: { anyOf: [
+        { type: "null" },
+        { type: "object", properties: {
+          runID: { type: "string" }, mode: { type: "string", enum: ["manual", "auto"] },
+          phase: { type: "string", enum: ["waiting", "generating", "splitting", "fragment", "merge", "complete", "failed", "cancelled"] },
+          startedAt: { type: "number" }, endedAt: { type: "number" }, calls: { type: "number" },
+          completedFragments: { type: "number" }, mergeRound: { type: "number" },
+          retry: { type: "object", properties: {
+            attempt: { type: "number" }, maxAttempts: { type: "number" }, retryAt: { type: "number" },
+          }, required: ["attempt", "maxAttempts"], additionalProperties: false },
+        }, required: ["runID", "mode", "phase", "startedAt", "calls", "completedFragments", "mergeRound"], additionalProperties: false },
+      ] } }, required: ["progress"], additionalProperties: false },
+    },
     compact: {
       input: { type: "object", properties: {
         sessionID: { type: "string" }, instructions: { type: "string" },

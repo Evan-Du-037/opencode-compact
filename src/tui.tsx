@@ -12,6 +12,7 @@ import { PLUGIN_ID, type Fields } from "./core.ts"
 
 import { compactSession } from "./compact.ts"
 import { clearField, moveBetweenFields } from "./form-editing.ts"
+import { CompactProgressView } from "./progress-view.tsx"
 
 const empty: Fields = { instructions: "" }
 
@@ -36,6 +37,7 @@ async function edit(api: TuiPluginApi, fields: Fields) {
 }
 
 const tui = (api: TuiPluginApi) => {
+  const removeProgress = api.ui.slot({ append: "session.composer.top", render: props => <CompactProgressView api={api} sessionID={props.sessionID} /> })
   // Drafts belong to a session and live for this TUI process. Successful compaction consumes them.
   const drafts = new Map<string, Fields>()
   const inFlight = new Set<string>()
@@ -75,6 +77,7 @@ const tui = (api: TuiPluginApi) => {
         }} />, () => { opened = false; if (!submitted) controller.abort() })
     } }],
   }))
+  return removeProgress
 }
 
 function Form(props: { api: TuiPluginApi; controller: AbortController; initial: Fields; saveDraft: (fields: Fields) => void; submit: (fields: Fields) => void }) {

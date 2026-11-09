@@ -4,11 +4,14 @@ import { randomUUID } from "node:crypto"
 import { compactRpc, type CompactInput } from "./rpc.ts"
 import { compactionInstructions } from "./prompt.ts"
 import { PLUGIN_ID } from "./core.ts"
+import { summarizeHistory } from "./summary.ts"
+import { createProgressStore } from "./progress.ts"
 
 /** RPC and hooks live in the same v2 location; no filesystem rendezvous or backend IDs. */
 export default Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
+    const progress = createProgressStore()
     const pending = new Map<string, { id: string; prompt: string; model?: CompactInput["model"]; used: boolean; controller: AbortController; error?: string }>()
     const automatic = new Set<AbortController>()
     const templatePath = typeof ctx.options.templatePath === "string" ? ctx.options.templatePath : undefined
@@ -22,6 +25,8 @@ export default Plugin.define({
       if (manual && (!task || marker.id !== task.id)) return
       if (task?.used) throw new Error("本次压缩请求已执行。")
       if (task) task.used = true
+      const runID = task?.id ?? randomUUID()
+      progress.begin(request.sessionID, runID, task ? "manual" : "auto")
       const controller = task?.controller ?? new AbortController()
       const monitor = task ? undefined : new AbortController()
       if (monitor) {
@@ -35,10 +40,17 @@ export default Plugin.define({
         const prompt = task?.prompt ?? await compactionInstructions({ instructions: "" }, templatePath)
         // v2 appends a hard-coded template after hooks. Supplying result skips that call.
         // Automatic compaction uses only the template's general requirements, never manual drafts.
-        const result = await ctx.generate.text({ model: task?.model ?? request.model, prompt: `${prompt}\n\n<conversation-history>\n${JSON.stringify(request.messages)}\n</conversation-history>` }, { signal: controller.signal })
-        if (!result.text.trim()) throw new Error("模型返回了空摘要。")
-        request.result = { summary: result.text }
+        const model = task?.model ?? request.model
+        const summary = await summarizeHistory({
+          prompt, messages: request.messages, signal: controller.signal,
+          onProgress: update => progress.update(request.sessionID, runID, update),
+          generate: async (prompt, signal) => (await ctx.generate.text({ model, prompt }, { signal })).text,
+        })
+        request.result = { summary }
+        // This reports generation completion, not the end of any subsequently queued conversation.
+        progress.finish(request.sessionID, runID, "complete")
       } catch (error) {
+        progress.finish(request.sessionID, runID, controller.signal.aborted ? "cancelled" : "failed")
         if (task) task.error = error instanceof Error ? error.message : String(error)
         throw error
       } finally {
@@ -47,11 +59,16 @@ export default Plugin.define({
       }
     })
     const rpc = await ctx.rpc.register(compactRpc, {
+      async progress(value) {
+        const { sessionID } = value as { sessionID: string }
+        return { progress: progress.get(sessionID) }
+      },
       async compact(value) {
         const { sessionID, instructions, model } = value as CompactInput
         if (pending.has(sessionID)) return { ok: false, error: "此会话已有压缩请求，请等待完成。" }
         const task = { id: `msg_${randomUUID().replaceAll("-", "")}`, prompt: "", model, used: false, controller: new AbortController(), error: undefined as string | undefined }
         pending.set(sessionID, task)
+        progress.begin(sessionID, task.id, "manual")
         try {
           const session = await ctx.session.get({ sessionID })
           if (await realpath(session.location.directory) !== await realpath(ctx.location.directory))
@@ -69,10 +86,11 @@ export default Plugin.define({
             throw new Error(task.error || (message?.type === "compaction" && message.status === "failed" ? message.error.message : "未找到本次自定义压缩的完成记录。"))
           return { ok: true }
         } catch (error) {
+          progress.finish(sessionID, task.id, task.controller.signal.aborted ? "cancelled" : "failed")
           return { ok: false, error: task.error || (error instanceof Error ? error.message : String(error)) }
         } finally { task.controller.abort(); pending.delete(sessionID) }
       },
     })
-    return async () => { for (const controller of automatic) controller.abort(); for (const task of pending.values()) task.controller.abort(); await rpc.dispose(); await hook.dispose() }
+    return async () => { for (const controller of automatic) controller.abort(); for (const task of pending.values()) task.controller.abort(); await rpc.dispose(); await hook.dispose(); progress.clear() }
   },
 })

@@ -32,7 +32,7 @@ async function fixture(mode: Mode = "manual", reply = "摘要", options = {}) {
     rpc: { register: async (_: any, handlers: any) => { rpc = handlers; return { dispose: async () => {} } } },
   }
   const cleanup = await plugin.setup(ctx)
-  return { run: (instructions = "", model?: { providerID: string; id: string; variant?: string }) => rpc.compact({ sessionID: "s", instructions, model }), invoke: async () => { const event: any = request(); await hook(event); return event }, generated, selections, admissions, cleanup, ctx }
+  return { progress: (sessionID = "s") => rpc.progress({ sessionID }), run: (instructions = "", model?: { providerID: string; id: string; variant?: string }) => rpc.compact({ sessionID: "s", instructions, model }), invoke: async () => { const event: any = request(); await hook(event); return event }, generated, selections, admissions, cleanup, ctx }
 }
 
 test("manual compaction commits and uses the selected model even when the hook supplies another model", async () => {
@@ -125,5 +125,36 @@ test("disposing the plugin cancels in-flight automatic generation", async () => 
   const result = f.invoke().catch(error => error)
   await ready
   await f.cleanup?.()
-  expect((await result).message).toBe("cancelled")
+  expect((await result).name).toBe("AbortError")
+})
+
+test("progress is available while manual and automatic generation are blocked, and stops when generation finishes", async () => {
+ for (const mode of ["manual", "before_auto"] as const) {
+  const f = await fixture(mode)
+  let started!: () => void, finish!: () => void
+  const ready = new Promise<void>(r => { started = r })
+  const gate = new Promise<void>(r => { finish = r })
+  f.ctx.generate.text = async () => { started(); await gate; return { text: "summary" } }
+  const pending = mode === "manual" ? f.run("PRIVATE_REQUIREMENT") : f.invoke()
+  await ready
+  const during = (await f.progress()).progress
+  expect(during.phase).toBe("generating")
+  expect(during.calls).toBe(1)
+  expect(during.mode).toBe(mode === "manual" ? "manual" : "auto")
+  expect(during.endedAt).toBeUndefined()
+  expect(JSON.stringify(during)).not.toContain("PRIVATE_REQUIREMENT")
+  expect((await f.progress("another-session")).progress).toBeNull()
+  finish()
+  await pending
+  expect((await f.progress()).progress.phase).toBe("complete")
+  expect((await f.progress()).progress.endedAt).toBeNumber()
+  await f.cleanup?.()
+ }
+})
+test("a failed generation has a terminal progress state", async () => {
+ const f = await fixture()
+ f.ctx.generate.text = async () => { throw new Error("provider failed") }
+ expect((await f.run()).ok).toBe(false)
+ expect((await f.progress()).progress.phase).toBe("failed")
+ await f.cleanup?.()
 })
